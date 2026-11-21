@@ -1,0 +1,74 @@
+{
+  "version": 2,
+  "name": "example-v2-platforms",
+  "unmatched_board": "REVIEW",
+  "active_product_scopes": [
+    "rhel10",
+    "user_selected"
+  ],
+  "platforms": [
+    {
+      "name": "NVIDIA Grace server class (HPE DL384, Supermicro ARS-111GL, GIGABYTE XV23-VC0)",
+      "product_scope": "rhel10",
+      "support_basis": "certified_rhel10",
+      "match_scope": "shared_driver",
+      "architecture": "arm64",
+      "paths": [
+        "drivers/perf/arm_cspmu/nvidia_cspmu.c",
+        "drivers/vfio/pci/nvgrace-gpu/*"
+      ]
+    },
+    {
+      "name": "NXP i.MX8M Quad (Advantech ECU-150, RHEL 9.3)",
+      "product_scope": "rhel10",
+      "support_basis": "certified_rhel9_proxy",
+      "match_scope": "soc_shared",
+      "architecture": "arm64",
+      "paths": [
+        "arch/arm64/boot/dts/freescale/imx8mq.dtsi"
+      ],
+      "identifiers": {
+        "dt_compatible": [
+          "fsl,imx8mq"
+        ]
+      }
+    },
+    {
+      "name": "Renesas R-Car S4 (RHIVOS automotive scope)",
+      "product_scope": "rhivos",
+      "support_basis": "product_documented",
+      "match_scope": "soc_shared",
+      "architecture": "arm64",
+      "paths": [
+        "arch/arm64/boot/dts/renesas/r8a779f0.dtsi",
+        "arch/arm64/boot/dts/renesas/r8a779f0-spider.dts",
+        "arch/arm64/boot/dts/renesas/r8a779f0-spider-cpu.dtsi",
+        "arch/arm64/boot/dts/renesas/r8a779f0-spider-ethernet.dtsi",
+        "arch/arm64/boot/dts/renesas/r8a779f4.dtsi",
+        "arch/arm64/boot/dts/renesas/r8a779f4-s4sk.dts"
+      ],
+      "identifiers": {
+        "dt_compatible": [
+          "renesas,r8a779f0",
+          "renesas,r8a779f4",
+          "renesas,s4sk",
+          "renesas,spider-breakout",
+          "renesas,spider-cpu"
+        ]
+      }
+    }
+  ],
+  "excluded_platforms": [
+    {
+      "name": "Orange Pi on Rockchip (5, 5 Plus, CM5 and related boards)",
+      "product_scope": "rhel10",
+      "support_basis": "engineering_exclusion",
+      "match_scope": "exact_board",
+      "architecture": "arm64",
+      "paths": [
+        "arch/arm64/boot/dts/rockchip/*-orangepi-*",
+        "arch/arm64/boot/dts/rockchip/Makefile"
+      ]
+    }
+  ]
+}

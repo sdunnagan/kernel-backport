@@ -1,0 +1,2220 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-only
+"""kernel-backport: one workflow around the tested planner and executor engines.
+
+Only the executor is allowed to modify the user's kernel working tree.
+The source planner JSON remains immutable. Engineer changes live in the worksheet.
+"""
+from __future__ import annotations
+
+import argparse
+import contextlib
+import collections
+import fcntl
+import hashlib
+import heapq
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+
+from review_queues import build_queues, render_text, write_reports, _fresh_icc
+from text_output import ColumnWriter, wrap_line, wrap_text
+from review_assessor import attach_cached_assessments, assess_queues
+from feature_conditioner import (recommend_conditioning, audit_conditioning,
+                                 audit_conditioning_result, audit_manual_decision,
+                                 write_conditioning_report, RequestCounter)
+from feature_assessor import (read_feature_cache, feature_metadata,
+                              assessment_cache_key, _digest,
+                              SCHEMA_VERSION as FEATURE_SCHEMA_VERSION,
+                              build_features, build_disagreement_features,
+                              attach_feature_cache,
+                              assess_features as assess_feature_groups,
+                              feature_text, write_feature_reports,
+                              DEFAULT_FEATURE_MODEL, resolve_feature_models)
+
+ROOT = Path(__file__).resolve().parent
+VERSION = (ROOT / "VERSION").read_text(encoding="ascii").strip()
+PLANNER = ROOT / "engines/planner/kernel-backport-planner"
+EXECUTOR = ROOT / "engines/backporter/kernel-backporter"
+HEADER = re.compile(r'^(?P<sha>[0-9a-f]{12})(?: \[[^\]\n]+\])? \(".*"\)$')
+SHA40 = re.compile(r'^[0-9a-f]{40}$')
+DECISIONS = ("TAKE", "SKIP", "REVIEW")
+PROJECT_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
+
+
+class BackportError(Exception):
+    pass
+
+
+def atomic_json(path: Path, data: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".kernel-backport-")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            os.fchmod(stream.fileno(), 0o600)
+            json.dump(data, stream, sort_keys=True, indent=2)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(tmp, path)
+    finally:
+        Path(tmp).unlink(missing_ok=True)
+
+
+def atomic_bytes(path: Path, contents: bytes) -> None:
+    mode = stat.S_IMODE(path.stat().st_mode) if path.exists() else 0o600
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".worksheet-")
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            os.fchmod(stream.fileno(), mode)
+            stream.write(contents)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(tmp, path)
+    finally:
+        Path(tmp).unlink(missing_ok=True)
+
+
+def resolve_planned_sha(value: str, ordered: list[str]) -> str:
+    if not re.fullmatch(r"[0-9a-fA-F]{7,40}", value):
+        raise BackportError("expected a Git SHA abbreviation (7 to 40 hex digits)")
+    found = [s for s in ordered if s.startswith(value.lower())]
+    if len(found) != 1:
+        raise BackportError(f"SHA {value} is not unique or not present in this plan")
+    return found[0]
+
+def git(repo: Path, *args: str, check: bool = True) -> str:
+    result = subprocess.run(["git", *args], cwd=repo, capture_output=True, text=True)
+    if check and result.returncode:
+        raise BackportError(f"git {' '.join(args)} failed: {result.stderr.strip()}")
+    return result.stdout.strip()
+
+
+def valid_sha(value) -> bool:
+    return isinstance(value, str) and bool(SHA40.fullmatch(value))
+
+
+def sha(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def path_arg(value: str | None) -> Path:
+    if value:
+        return Path(value).expanduser().resolve()
+    workspace = os.environ.get("KERNEL_WORKSPACE_DIR", "")
+    if not workspace:
+        raise BackportError("specify --results-dir (or set KERNEL_WORKSPACE_DIR)")
+    root = Path(workspace).expanduser().resolve() / "backport-plans"
+    candidates = []
+    if root.is_dir():
+        for child in root.iterdir():
+            m = re.fullmatch(r"backport_plan_(\d+)", child.name)
+            if m and child.is_dir() and (child / "backport_plan.json").is_file() and (child / "backport_worksheet.txt").is_file() and child.with_suffix(".zip").is_file():
+                candidates.append((int(m.group(1)), child))
+    if not candidates:
+        raise BackportError(f"no complete plan and worksheet found under {root}")
+    return max(candidates)[1]
+
+
+def repo_arg(value: str | None) -> Path:
+    if value:
+        repo = Path(value).expanduser().resolve()
+    else:
+        ws, cs = os.environ.get("KERNEL_WORKSPACE_DIR"), os.environ.get("CS_VERSION")
+        if ws and cs:
+            repo = Path(ws).expanduser().resolve() / f"centos-stream-{cs}"
+        elif os.environ.get("KERNEL_SRC_DIR"):
+            repo = Path(os.environ["KERNEL_SRC_DIR"]).expanduser().resolve()
+        else:
+            repo = Path.cwd().resolve()
+    git(repo, "rev-parse", "--git-dir")
+    return repo
+
+
+class Plan:
+    """Frozen planner data and strictly validated, engineer-editable worksheet."""
+    def __init__(self, directory: Path):
+        if directory.is_file() and directory.name == "backport_plan.json":
+            directory = directory.parent
+        self.directory = directory.resolve()
+        self.planpath = self.directory / "backport_plan.json"
+        self.worksheet = self.directory / "backport_worksheet.txt"
+        if self.planpath.is_symlink() or self.worksheet.is_symlink():
+            raise BackportError("plan and worksheet must not be symlinks")
+        try:
+            self.raw = self.planpath.read_bytes()
+            self.payload = json.loads(self.raw)
+        except (OSError, ValueError) as exc:
+            raise BackportError(f"cannot read plan JSON: {exc}") from exc
+        if not isinstance(self.payload, dict):
+            raise BackportError("planner JSON is not an object")
+        for key in ("downstream", "replay_start", "target"):
+            if not valid_sha(self.payload.get(key)):
+                raise BackportError(f"invalid plan field {key}")
+        if self.payload["downstream"] != self.payload["replay_start"]:
+            raise BackportError("downstream differs from replay_start")
+        self.baseline = self.payload["replay_start"]
+        self.base_order = self.payload.get("order")
+        self.base_commits = self.payload.get("commits")
+        if not isinstance(self.base_order, list) or not isinstance(self.base_commits, dict):
+            raise BackportError("planner JSON missing order/commits")
+        if len(self.base_order) != len(set(self.base_order)):
+            raise BackportError("duplicate plan SHA")
+        for s in self.base_order:
+            if not valid_sha(s) or not isinstance(self.base_commits.get(s), dict):
+                raise BackportError(f"invalid plan commit {s}")
+            if self.base_commits[s].get("advisor_decision") not in DECISIONS:
+                raise BackportError(f"invalid advisor decision for {s}")
+        self.plan_digest = sha(self.raw)
+        # Never alter the advisor's original plan JSON. Additional engineer-selected
+        # commits and explicit dependency relationships live in a separate overlay.
+        self.additionspath = self.directory / ".kernel-backport" / "additions.json"
+        if self.additionspath.is_symlink():
+            raise BackportError("additions overlay must not be a symlink")
+        self.additions = self._load_additions()
+        self.order = list(self.base_order)
+        self.commits = {s: json.loads(json.dumps(self.base_commits[s])) for s in self.base_order}
+        for item in self.additions["commits"]:
+            rec = item["record"]
+            self.order.append(item["sha"])
+            self.commits[item["sha"]] = json.loads(json.dumps(rec))
+        for relation in self.additions["relationships"]:
+            dep, consumer = relation["prerequisite"], relation["consumer"]
+            if consumer not in self.commits or dep not in self.commits:
+                raise BackportError("engineer prerequisite edge references an unknown plan SHA")
+            self.commits[consumer].setdefault("advisor_prerequisites", []).append(
+                {"sha": dep, "reason": "engineer-added prerequisite", "engineer_verified": True})
+        self.statepath = self.directory / ".kernel-backport" / "state.json"
+        self.iccpath = self.directory / ".kernel-backport" / "icc.json"
+        self.lines = self._read_worksheet()
+
+    def _load_additions(self) -> dict:
+        empty = {"schema": 1, "source_plan_sha256": self.plan_digest,
+                 "commits": [], "relationships": []}
+        if not self.additionspath.is_file():
+            return empty
+        try:
+            obj = json.loads(self.additionspath.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise BackportError(f"cannot read engineer additions: {exc}") from exc
+        if (not isinstance(obj, dict) or obj.get("schema") != 1 or
+                obj.get("source_plan_sha256") != self.plan_digest or
+                not isinstance(obj.get("commits"), list) or
+                not isinstance(obj.get("relationships"), list)):
+            raise BackportError("engineer additions do not match immutable planner source")
+        seen = set(self.base_order)
+        for item in obj["commits"]:
+            if not isinstance(item, dict) or not valid_sha(item.get("sha")) or item["sha"] in seen:
+                raise BackportError("duplicate or invalid engineer-added SHA")
+            seen.add(item["sha"])
+            rec = item.get("record")
+            if (not isinstance(rec, dict) or rec.get("advisor_decision") != "REVIEW" or
+                    rec.get("subject") is None or rec.get("origin") != "engineer-added"):
+                raise BackportError("invalid engineer-added commit record")
+            # Optional 0.1.37 provenance is compatible with older overlays.
+            if "outside_target" in item and not isinstance(item["outside_target"], bool):
+                raise BackportError("invalid outside-target exception metadata")
+            verified = item.get("verified_fixes", [])
+            if (not isinstance(verified, list) or
+                    any(not valid_sha(s) for s in verified) or
+                    len(verified) != len(set(verified)) or
+                    (verified and rec.get("fixes") != verified)):
+                raise BackportError("invalid verified Fixes provenance")
+        pairs = set()
+        for edge in obj["relationships"]:
+            if not isinstance(edge, dict) or not isinstance(edge.get("consumer"), str) or not isinstance(edge.get("prerequisite"), str):
+                raise BackportError("invalid engineer prerequisite relationship")
+            a, b = edge["consumer"], edge["prerequisite"]
+            if a not in seen or b not in seen or (a, b) in pairs:
+                raise BackportError("duplicate/unknown engineer prerequisite relationship")
+            pairs.add((a,b))
+        return obj
+
+    def _read_worksheet(self) -> list[str]:
+        try:
+            lines = self.worksheet.read_text(encoding="utf-8").splitlines(keepends=True)
+        except (OSError, UnicodeError) as exc:
+            raise BackportError(f"cannot read worksheet: {exc}") from exc
+        content = [l.rstrip("\r\n") for l in lines]
+        marks = [i for i, s in enumerate(content) if s == "BACKPORT WORKSHEET (oldest first)"]
+        if len(marks) != 1 or marks[0] + 1 >= len(lines) or not re.fullmatch(r"={40,}", content[marks[0] + 1]):
+            raise BackportError("invalid/missing BACKPORT WORKSHEET section")
+        self.start = marks[0] + 2
+        self.end = len(lines)
+        for i in range(self.start, len(lines) - 1):
+            if content[i] and not content[i][0].isspace() and re.fullmatch(r"={40,}", content[i+1]):
+                self.end = i
+                break
+        self.blocks = {}
+        ordered = []
+        for i in range(self.start, self.end):
+            m = HEADER.fullmatch(content[i])
+            if m:
+                ordered.append(m.group("sha"))
+                self.blocks[m.group("sha")] = [i, self.end]
+                if len(ordered) > 1:
+                    self.blocks[ordered[-2]][1] = i
+        if ordered != [s[:12] for s in self.order]:
+            raise BackportError("worksheet order/identity differs from immutable plan JSON")
+        self.overrides = {}
+        self.human_overrides = {}
+        self.auto_overrides = {}
+        for full in self.order:
+            short = full[:12]
+            begin, end = self.blocks[short]
+            seen = {}
+            for i in range(begin+1, end):
+                line = content[i]
+                for field in ("advisor", "engineer-decision", "engineer-rationale",
+                              "auto-decision", "auto-rationale", "auto-source"):
+                    prefix = f"      {field}: "
+                    if line.startswith(prefix):
+                        if field in seen:
+                            raise BackportError(f"duplicate {field} for {short}")
+                        seen[field] = line[len(prefix):]
+                    elif line.startswith(f"      {field}:"):
+                        raise BackportError(f"malformed {field} for {short}")
+            if seen.get("advisor") != self.commits[full]["advisor_decision"]:
+                raise BackportError(f"worksheet advisor decision does not match JSON for {short}")
+            decision = seen.get("engineer-decision")
+            if decision is not None:
+                if decision not in DECISIONS:
+                    raise BackportError(f"invalid engineer decision for {short}: {decision}")
+                self.human_overrides[full] = {"decision": decision, "rationale": seen.get("engineer-rationale", "")}
+            elif "engineer-rationale" in seen:
+                raise BackportError(f"rationale without engineer decision for {short}")
+            automatic = seen.get("auto-decision")
+            if automatic is not None:
+                if automatic != "SKIP" or not seen.get("auto-rationale", "").strip() or not seen.get("auto-source", "").strip():
+                    raise BackportError(f"invalid automatic SKIP/provenance for {short}")
+                self.auto_overrides[full] = {"decision": "SKIP", "rationale": seen["auto-rationale"],
+                                             "source": seen["auto-source"]}
+            elif "auto-rationale" in seen or "auto-source" in seen:
+                raise BackportError(f"automatic rationale/source without auto decision for {short}")
+            # A deliberate engineer decision always has precedence over automation.
+            if full in self.human_overrides:
+                self.overrides[full] = self.human_overrides[full]
+            elif full in self.auto_overrides:
+                self.overrides[full] = self.auto_overrides[full]
+        return lines
+
+    def effective(self, commit: str) -> str:
+        return self.overrides.get(commit, {}).get("decision", self.commits[commit]["advisor_decision"])
+
+    def revision(self) -> str:
+        # Managed backporter status lines do not influence the decision revision.
+        choices = {s: self.effective(s) for s in self.order}
+        return sha(json.dumps({"source_sha256": self.plan_digest, "decisions": choices,
+                               "engineer_overrides": self.human_overrides,
+                               "auto_overrides": self.auto_overrides,
+                               "additions": self.additions}, sort_keys=True).encode())
+
+    def advisor_readiness_blockers(self) -> list[dict]:
+        """Reconcile immutable planner readiness issues with explicit engineer decisions.
+
+        A planner escalation disagreement, failure or budget deferral is resolved
+        only by an engineer TAKE/SKIP override with a nonblank rationale.  An
+        engineer REVIEW remains unresolved.  Other planner execution blockers
+        must not be silently waived by a worksheet decision.
+
+        Deliberately reconstruct this from the *source plan* on every check and
+        execution, rather than trusting the old planner execution_ready flag or
+        a stale/possibly pre-0.1.32 ICC attestation.
+        """
+        advisor = self.payload.get("advisor") or {}
+        if not isinstance(advisor, dict):
+            raise BackportError("invalid planner advisor readiness data")
+        issues = advisor.get("execution_blockers", [])
+        if not isinstance(issues, list):
+            raise BackportError("invalid planner advisor execution blockers")
+        unresolved: dict[tuple[str, str], dict] = {}
+        deferred = set()
+
+        def approved(commit: str) -> bool:
+            # Engineer input always wins, including an explicit REVIEW that
+            # reopens a previously auto-adjudicated disagreement.
+            if commit in self.human_overrides:
+                override = self.human_overrides[commit]
+                return (override.get("decision") in ("TAKE", "SKIP") and
+                        bool(str(override.get("rationale") or "").strip()))
+            automatic = self.auto_overrides.get(commit, {})
+            if self.base_commits[commit].get("advisor_escalation_status") != "disagree":
+                return False
+            # This source form is only written by the explicit
+            # --auto-skip-disagreements guarded feature conditioning path;
+            # it is not an engineer's signature and never resolves budget or
+            # tool-error escalations.
+            provenance = str(automatic.get("source") or "")
+            return (automatic.get("decision") == "SKIP"
+                    and bool(str(automatic.get("rationale") or "").strip())
+                    and bool(re.fullmatch(
+                        r"(?:F|D)-[0-9a-f]{12} model=gpt-6\.1-sol "
+                        r"evidence=[0-9a-f]{64} resolution=advisor-disagreement",
+                        provenance)))
+
+        def record(kind: str, commit: str | None, reason: str) -> None:
+            if commit and kind.startswith("ADVISOR_ESCALATION->") and approved(commit):
+                return
+            key = (kind, commit or "")
+            unresolved.setdefault(key, {"kind": kind, **({"sha": commit} if commit else {}),
+                                    "reason": reason})
+
+        # Source per-commit status is authoritative, including for a grouped
+        # budget issue lacking a SHA.  A missing/malformed aggregate issues
+        # list must not allow unresolved individual escalations through.
+        for commit, entry in self.base_commits.items():
+            status = entry.get("advisor_escalation_status")
+            if status not in ("disagree", "error", "budget-deferred"):
+                continue
+            kind = {"disagree": "ADVISOR_ESCALATION->DISAGREEMENT",
+                    "error": "ADVISOR_ESCALATION->ERROR",
+                    "budget-deferred": "ADVISOR_ESCALATION->BUDGET"}[status]
+            if status == "budget-deferred":
+                deferred.add(commit)
+            record(kind, commit, f"{status}: explicit engineer TAKE/SKIP with --reason required")
+
+        for issue in issues:
+            if not isinstance(issue, dict) or not isinstance(issue.get("kind"), str):
+                raise BackportError("invalid planner advisor execution blocker")
+            kind = issue["kind"]
+            commit = issue.get("sha")
+            if commit is not None and (not valid_sha(commit) or commit not in self.base_commits):
+                raise BackportError("invalid planner advisor execution blocker SHA")
+            if kind.startswith("ADVISOR_ESCALATION->"):
+                if kind == "ADVISOR_ESCALATION->BUDGET" and not commit and deferred:
+                    # The aggregate issue is represented by every deferred
+                    # commit above, each requiring its own engineer resolution.
+                    continue
+                record(kind, commit, str(issue.get("reason") or "advisor review required"))
+            elif kind == "TAKE->REVIEW":
+                # The planner's immutable source describes the selection at
+                # planning time. Resolve its TAKE-consumer -> REVIEW-provider
+                # issue using the *current* worksheet, not its stale vote.
+                # The consumer may now be SKIP, or an engineer may explicitly
+                # TAKE the provider. All other cases (including malformed
+                # provenance and a still-unselected provider) fail closed.
+                provider = issue.get("prerequisite_sha")
+                consumer = issue.get("consumer_sha")
+                if (isinstance(provider, str) and provider in self.commits
+                        and isinstance(consumer, str) and consumer in self.commits
+                        and (self.effective(consumer) != "TAKE"
+                             or self.effective(provider) == "TAKE")):
+                    continue
+                record(kind, commit, str(issue.get("reason") or "planner prerequisite unresolved"))
+            else:
+                # Unrelated non-escalation planner readiness issues stay blocked.
+                record(kind, commit, str(issue.get("reason") or "planner not execution-ready"))
+
+        if advisor.get("execution_ready") is False and not issues and not unresolved:
+            record("ADVISOR_SOURCE_NOT_READY", None,
+                   "planner reported not execution-ready without a resolvable issue")
+        return sorted(unresolved.values(), key=lambda x: (x["kind"], x.get("sha", "")))
+
+    def add_commit(self, repo: Path, commit: str, decision: str, reason: str,
+                   required_by: list[str], requires: list[str],
+                   fixes: list[str], allow_outside_target: bool) -> None:
+        """Add a verified upstream commit without regenerating the frozen plan.
+
+        Fixes: is historical provenance, not a hard prerequisite. Explicit
+        --requires / --required-by add *separate* dependency edges. The overlay
+        and worksheet are changed only after all validations have succeeded.
+        """
+        if decision not in DECISIONS:
+            raise BackportError("invalid engineer decision")
+        if not reason or not reason.strip() or "\n" in reason or "\r" in reason:
+            raise BackportError("--reason is required and must be one line")
+        if not re.fullmatch(r"[0-9a-fA-F]{7,40}", commit):
+            raise BackportError("engineer addition requires a Git SHA (7 to 40 hex digits)")
+        upstream = git(repo, "rev-parse", "--verify", f"{commit}^{{commit}}")
+        if not valid_sha(upstream):
+            raise BackportError("cannot resolve upstream SHA")
+        if upstream in self.base_order:
+            raise BackportError("commit already present in plan; use 'decide' instead")
+        if subprocess.run(["git", "merge-base", "--is-ancestor", upstream, self.baseline],
+                          cwd=repo, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
+            raise BackportError("commit is already an ancestor of the downstream baseline")
+        if len(git(repo, "rev-list", "--parents", "-n", "1", upstream).split()) > 2:
+            raise BackportError("merge commits are not supported as ordinary cherry-picks")
+        title = git(repo, "log", "-1", "--format=%s", upstream)
+        if not title or any(c in title for c in ("\n", "\r")):
+            raise BackportError("invalid upstream commit subject")
+        files = git(repo, "diff-tree", "--root", "--no-commit-id", "--name-only", "-r", upstream).splitlines()
+        consumers = [resolve_planned_sha(x, self.order) for x in required_by]
+        providers = [resolve_planned_sha(x, self.order) for x in requires]
+        fixed = [resolve_planned_sha(x, self.order) for x in fixes]
+        if (len(set(consumers)) != len(consumers) or
+                len(set(providers)) != len(providers) or
+                len(set(fixed)) != len(fixed)):
+            raise BackportError("duplicate --required-by, --requires, or --fixes SHA")
+        if fixes:
+            # Verify the immutable upstream Git commit message, never just an
+            # engineer-provided guess about its Fixes: relationship.
+            message = git(repo, "log", "-1", "--format=%B", upstream)
+            trailers = re.findall(r"(?im)^[ \t]*Fixes:[ \t]*([0-9a-f]{7,40})(?=[ \t(]|$)", message)
+            for antecedent in fixed:
+                if not any(antecedent.startswith(short.lower()) for short in trailers):
+                    raise BackportError(
+                        f"commit {upstream[:12]} has no Fixes: trailer for {antecedent[:12]}")
+        # Check ancestry only when the target object is available. A missing
+        # target must not be confused with an explicit out-of-range exception.
+        git(repo, "cat-file", "-e", f"{self.payload['target']}^{{commit}}")
+        outside_target = subprocess.run(
+            ["git", "merge-base", "--is-ancestor", upstream, self.payload["target"]],
+            cwd=repo, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode != 0
+        if outside_target and not allow_outside_target:
+            raise BackportError(
+                "commit is outside the frozen upstream target; supply "
+                "--allow-outside-target and a documented --reason")
+        requested_edges = ([{"consumer": consumer, "prerequisite": upstream}
+                            for consumer in consumers] +
+                           [{"consumer": upstream, "prerequisite": provider}
+                            for provider in providers])
+        if upstream in self.commits:
+            # An exact repeated request is safe and does not invalidate ICC.
+            existing = next(x for x in self.additions["commits"] if x["sha"] == upstream)
+            human = self.human_overrides.get(upstream, {})
+            old_edges = [e for e in self.additions["relationships"]
+                         if upstream in (e["consumer"], e["prerequisite"])]
+            if (existing.get("reason") == reason.strip() and
+                    human.get("decision") == decision and
+                    human.get("rationale") == reason.strip() and
+                    existing.get("outside_target", False) == outside_target and
+                    existing.get("verified_fixes", []) == fixed and
+                    sorted(old_edges, key=lambda e: (e["consumer"], e["prerequisite"])) ==
+                    sorted(requested_edges, key=lambda e: (e["consumer"], e["prerequisite"]))):
+                print(f"Upstream {upstream[:12]} already added with identical selection; unchanged")
+                return
+            raise BackportError(
+                "commit already engineer-added with different decision/provenance; "
+                "use 'decide' to change its selection")
+        state = load_state(self, missing_ok=True)
+        applied = set()
+        if state:
+            applied, _ = existing_phase_entries(state, repo)
+        if any(s in applied for s in consumers):
+            raise BackportError("cannot attach a new prerequisite to an already applied commit")
+        record = {
+            "subject": title, "advisor_decision": "REVIEW", "advisor_rationale":
+                "Engineer-provided upstream SHA; no model evaluation performed",
+            "origin": "engineer-added", "files": files, "selected": True,
+            "match": {"status": "missing"}, "advisor_prerequisites": [],
+            "replay": "not-run", "direct": False,
+        }
+        if fixed:
+            record["fixes"] = fixed
+        additions = json.loads(json.dumps(self.additions))
+        additions["commits"].append({"sha": upstream, "record": record,
+                                     "reason": reason.strip(),
+                                     "outside_target": outside_target,
+                                     "verified_fixes": fixed})
+        additions["relationships"].extend(requested_edges)
+        lines = list(self.lines)
+        title_print = title.replace('"', "'")
+        new = [f'{upstream[:12]} [ENGINEER] ("{title_print}")\n',
+               '      origin: ENGINEER-ADDED (not evaluated by advisor)\n',
+               '      advisor: REVIEW\n',
+               '      advisor-rationale: Manually introduced upstream candidate\n',
+               f'      engineer-decision: {decision}\n',
+               f'      engineer-rationale: {reason.strip()}\n']
+        if outside_target:
+            new.append(f'      engineer-target-exception: {self.payload["target"][:12]} (explicitly authorized)\n')
+        for antecedent in fixed:
+            new.append(f'      engineer-verified-fixes: {antecedent[:12]}\n')
+        for consumer in consumers:
+            new.append(f'      engineer-required-by: {consumer[:12]}\n')
+        for provider in providers:
+            new.append(f'      engineer-requires: {provider[:12]}\n')
+        new.append('\n')
+        lines[self.end:self.end] = new
+        previous_worksheet = self.worksheet.read_bytes()
+        previous_additions = self.additionspath.read_bytes() if self.additionspath.exists() else None
+        try:
+            atomic_bytes(self.worksheet, ''.join(lines).encode('utf-8'))
+            atomic_json(self.additionspath, additions)
+            Plan(self.directory)  # Fail closed if the new state is inconsistent.
+        except Exception:
+            atomic_bytes(self.worksheet, previous_worksheet)
+            if previous_additions is None:
+                self.additionspath.unlink(missing_ok=True)
+            else:
+                atomic_bytes(self.additionspath, previous_additions)
+            raise
+        target_note = " (explicitly outside target)" if outside_target else ""
+        print(f"Added upstream {upstream[:12]} as {decision}{target_note}; rerun kernel-backport check")
+
+    def set_auto_skip(self, commit: str, rationale: str, source: str,
+                      *, resolve_disagreement: bool = False) -> None:
+        """Record a model-informed SKIP *as automation*, never as engineer approval.
+
+        Only the conditioner invokes this under the plan lock and after its
+        independent safeguards. Engineer edits override automatic choices.
+        """
+        decision = self.effective(commit) if commit in self.commits else None
+        if (commit not in self.order or
+                not (decision == "TAKE" or (resolve_disagreement and decision == "REVIEW"))
+                or commit in self.human_overrides or commit in self.auto_overrides):
+            raise BackportError("automatic SKIP requires unmodified planner TAKE or "
+                                "explicitly guarded disputed REVIEW")
+        escalation = self.commits[commit].get("advisor_escalation_status")
+        if decision == "REVIEW" and escalation != "disagree":
+            raise BackportError("automatic REVIEW exclusion requires a recorded "
+                                "Terra/Sol disagreement")
+        if escalation in ("disagree", "error", "budget-deferred"):
+            if (escalation != "disagree" or not resolve_disagreement or
+                    not re.fullmatch(
+                        r"(?:F|D)-[0-9a-f]{12} model=gpt-6\.1-sol "
+                        r"evidence=[0-9a-f]{64} resolution=advisor-disagreement",
+                        source)):
+                raise BackportError("automatic decision cannot resolve this advisor escalation")
+        if not rationale.strip() or not source.strip() or any(
+                "\n" in v or "\r" in v for v in (rationale, source)):
+            raise BackportError("automatic SKIP requires one-line evidence and rationale")
+        short = commit[:12]
+        begin, end = self.blocks[short]
+        lines = list(self.lines)
+        advisor_i = next(i for i in range(begin+1, end)
+                         if lines[i].startswith("      advisor: "))
+        additions = [f"      auto-decision: SKIP\n",
+                     f"      auto-rationale: {rationale.strip()}\n",
+                     f"      auto-source: {source.strip()}\n"]
+        lines[advisor_i+1:advisor_i+1] = additions
+        atomic_bytes(self.worksheet, "".join(lines).encode("utf-8"))
+
+    def set_decision(self, commit: str, decision: str, rationale: str | None) -> None:
+        if decision not in DECISIONS:
+            raise BackportError("engineer decision must be TAKE, SKIP or REVIEW")
+        matches = [s for s in self.order if s.startswith(commit.lower())]
+        if len(matches) != 1 or len(commit) < 7:
+            raise BackportError("commit abbreviation must uniquely identify an ordered plan SHA")
+        full = matches[0]
+        prior = self.effective(full)
+        if (decision in ("TAKE", "SKIP") and
+                self.base_commits.get(full, {}).get("advisor_escalation_status") in
+                    ("disagree", "error", "budget-deferred") and
+                not (rationale or "").strip()):
+            raise BackportError("resolving an advisor escalation requires --reason")
+        # Do not allow declaring an already applied change absent from the plan.
+        state = load_state(self, missing_ok=True)
+        if state:
+            for phase in state.get("phases", []):
+                jpath = Path(phase["journal"])
+                if jpath.is_file():
+                    journal = json.loads(jpath.read_text())
+                    if any(e.get("sha") == full and e.get("status") in ("APPLIED", "APPLIED_MANUALLY", "ALREADY_PRESENT") for e in journal.get("entries", [])) and decision != "TAKE":
+                        raise BackportError("cannot retroactively SKIP/REVIEW an already applied commit")
+        short = full[:12]
+        begin, end = self.blocks[short]
+        lines = list(self.lines)
+        target = [(i, lines[i]) for i in range(begin+1, end) if lines[i].startswith("      engineer-decision:") or lines[i].startswith("      engineer-rationale:")]
+        for i, _ in reversed(target):
+            del lines[i]
+        # Insert after advisor decision, leaving original evidence untouched.
+        advisor_i = next(i for i in range(begin+1, end) if lines[i].startswith("      advisor: "))
+        entries = [f"      engineer-decision: {decision}\n"]
+        if rationale:
+            if "\n" in rationale or "\r" in rationale:
+                raise BackportError("rationale must be a single line")
+            entries.append(f"      engineer-rationale: {rationale}\n")
+        lines[advisor_i+1:advisor_i+1] = entries
+        previous = self.worksheet.read_bytes()
+        new = "".join(lines).encode("utf-8")
+        if self.worksheet.read_bytes() != previous:
+            raise BackportError("worksheet changed during decision update")
+        st = stat.S_IMODE(self.worksheet.stat().st_mode)
+        fd, tmp = tempfile.mkstemp(dir=self.worksheet.parent, prefix=".worksheet-")
+        try:
+            with os.fdopen(fd, "wb") as f:
+                os.fchmod(f.fileno(), st)
+                f.write(new)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, self.worksheet)
+        finally:
+            Path(tmp).unlink(missing_ok=True)
+        print(f"{short}: {prior} -> {decision}; rerun kernel-backport check")
+
+
+def load_state(plan: Plan, *, missing_ok: bool = False) -> dict | None:
+    if not plan.statepath.is_file():
+        return None if missing_ok else {"schema": 1, "plan_sha256": plan.plan_digest, "phases": []}
+    try:
+        result = json.loads(plan.statepath.read_text())
+    except (OSError, ValueError) as exc:
+        raise BackportError(f"cannot read execution state: {exc}") from exc
+    if (not isinstance(result, dict) or result.get("schema") != 1
+            or result.get("plan_sha256") != plan.plan_digest
+            or not isinstance(result.get("phases"), list)):
+        raise BackportError("execution state does not match immutable planner source")
+    return result
+
+
+def existing_phase_entries(state: dict, repo: Path) -> tuple[set[str], str]:
+    done = set()
+    lasthead = None
+    for phase in state["phases"]:
+        jp = Path(phase["journal"])
+        if not jp.is_file():
+            continue
+        journal = json.loads(jp.read_text())
+        if journal.get("repo") != str(repo):
+            raise BackportError("execution journal repository differs from selected repo")
+        for e in journal.get("entries", []):
+            if e.get("status") in ("APPLIED", "APPLIED_MANUALLY", "ALREADY_PRESENT"):
+                done.add(e["sha"])
+                downstream = e.get("downstream_sha")
+                if downstream and subprocess.run(["git", "merge-base", "--is-ancestor", downstream, "HEAD"], cwd=repo, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode:
+                    raise BackportError(f"previously applied commit {downstream} is no longer reachable")
+        lasthead = journal.get("last_head")
+    return done, lasthead
+
+
+def git_clean(repo: Path) -> None:
+    if git(repo, "status", "--porcelain=v1"):
+        raise BackportError("kernel repository is not clean; resolve/abort Git operations first")
+
+
+def check_graph(plan: Plan, repo: Path, already: set[str]) -> tuple[list[str], list[dict], list[dict]]:
+    selected = [s for s in plan.order if plan.effective(s) == "TAKE"]
+    selected_set = set(selected)
+    pending = [s for s in selected if s not in already]
+    edges = {s: set() for s in pending}
+    blockers, warnings = [], []
+    original_positions = {s:i for i, s in enumerate(plan.order)}
+    # Fixes: is a historical regression link, never a hard graph dependency.
+    # Inspect informational relationships in the complete planner graph,
+    # including candidate-only nodes omitted from the executable TAKE order.
+    all_records = {**plan.base_commits, **plan.commits}
+    later_fixes = collections.defaultdict(set)
+    # Keep historical relationships from the immutable source plan even when
+    # an engineer adds a candidate-only fix to the executable worksheet. The
+    # engineer overlay intentionally has narrower metadata and must not erase
+    # the original Fixes: provenance used for MR completeness.
+    for records in (plan.base_commits, plan.commits):
+        for fix_sha, record in records.items():
+            for target in record.get("fixes", []):
+                if valid_sha(target):
+                    later_fixes[target].add(fix_sha)
+
+    def missing_and_unselected(other: str) -> bool:
+        if other in selected_set or other in already:
+            return False
+        record = all_records.get(other)
+        if not isinstance(record, dict):
+            return False  # Unknown does not mean missing.
+        match = record.get("match", {})
+        if (match.get("status") == "present"
+                and match.get("revert_status") not in ("reverted", "ambiguous")):
+            return False
+        # An exact shared ancestor is also satisfied, even if provenance
+        # indexing could not confidently classify an equivalent patch.
+        if subprocess.run(["git", "merge-base", "--is-ancestor", other, "HEAD"],
+                          cwd=repo, stdout=subprocess.DEVNULL,
+                          stderr=subprocess.DEVNULL).returncode == 0:
+            return False
+        return True
+
+    # MR later-fix completeness is independent of plan/tool/prompt version.
+    # An explicitly justified engineer omission is the only alternative to
+    # selecting the fix or establishing its downstream presence.
+
+    # A selected shared fix can refer to historical regressions in other CPU
+    # architectures. For an explicitly architecture-scoped backport, a missing
+    # original confined entirely to foreign arch/<name>/ code is not an
+    # actionable warning. Mixed/common-code originals still remain visible.
+    target_architectures = set(plan.payload.get("architecture_filter") or [])
+    def foreign_architecture_only(original_sha: str) -> bool:
+        if not target_architectures:
+            return False
+        record = all_records.get(original_sha) or {}
+        files = record.get("files") or []
+        if not files:
+            return False
+        owners = []
+        for path in files:
+            parts = path.split("/")
+            if len(parts) < 3 or parts[0] != "arch":
+                return False
+            owners.append(parts[1])
+        return set(owners).isdisjoint(target_architectures)
+
+    for s in selected:
+        rec = plan.commits[s]
+        for target in rec.get("fixes", []):
+            if (valid_sha(target) and missing_and_unselected(target)
+                    and not foreign_architecture_only(target)):
+                warnings.append({"kind": "FIXES_TARGET_NOT_SELECTED", "sha": s,
+                                 "fixes_target": target,
+                                 "note": "historical regression link, not a hard prerequisite"})
+        for fix in sorted(later_fixes.get(s, set())):
+            if not missing_and_unselected(fix):
+                continue
+            override = plan.human_overrides.get(fix, {})
+            final_decision = plan.effective(fix) if fix in plan.commits else "NOT_IN_PLAN"
+            rationale = override.get("rationale", "").strip()
+            if final_decision == "SKIP" and rationale:
+                subject = all_records.get(fix, {}).get("subject", "unknown subject")
+                warnings.append({
+                    "kind": "OMITTED_FIX", "sha": s, "fix_commit": fix,
+                    "reason": rationale,
+                    "trailer": f'Omitted-fix: {fix} ("{subject}") - {rationale}',
+                    "note": "Document this deliberately omitted later fix in the kernel MR",
+                })
+            else:
+                blockers.append({
+                    "kind": "UNRESOLVED_LATER_FIX", "sha": s, "fix_commit": fix,
+                    "fix_decision": final_decision,
+                    "note": (
+                        "Select the later fix TAKE, verify it is already downstream, "
+                        "or explicitly engineer-SKIP it with a nonempty technical "
+                        "rationale for the required Omitted-fix: MR documentation. "
+                        "Fixes: is not a hard cherry-pick prerequisite."
+                    ),
+                })
+        if rec.get("match", {}).get("revert_status") in ("reverted", "ambiguous"):
+            blockers.append({"kind": "REVERTED_IDENTITY", "sha": s})
+        for item in rec.get("advisor_prerequisites", []):
+            dep = item.get("sha") if isinstance(item, dict) else None
+            if not valid_sha(dep):
+                blockers.append({"kind": "INVALID_PREREQUISITE", "sha": s, "prerequisite": dep})
+                continue
+            if dep in already:
+                continue
+            dep_rec = plan.commits.get(dep)
+            if dep in selected_set:
+                if s in already and dep not in already:
+                    blockers.append({"kind": "LATE_PREREQUISITE", "sha": s, "prerequisite": dep})
+                if s in edges and dep in edges:
+                    edges[s].add(dep)
+                continue
+            if dep_rec is not None and dep_rec.get("match", {}).get("status") == "present" and dep_rec.get("match", {}).get("revert_status") not in ("reverted", "ambiguous"):
+                continue
+            # The prerequisite may be directly part of the downstream tree.
+            if git(repo, "cat-file", "-e", f"{dep}^{{commit}}", check=False) == "" and subprocess.run(["git", "merge-base", "--is-ancestor", dep, "HEAD"], cwd=repo, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
+                continue
+            blockers.append({"kind": "UNSATISFIED_PREREQUISITE", "sha": s, "prerequisite": dep,
+                             "prerequisite_decision": plan.effective(dep) if dep in plan.order else "not-in-plan"})
+    indegree = {s: len(deps) for s, deps in edges.items()}
+    dependents = collections.defaultdict(set)
+    for s, deps in edges.items():
+        for dep in deps:
+            dependents[dep].add(s)
+    heap = [(original_positions[s], s) for s in pending if indegree[s] == 0]
+    heapq.heapify(heap)
+    ordered = []
+    while heap:
+        _, s = heapq.heappop(heap)
+        ordered.append(s)
+        for dependent in dependents[s]:
+            indegree[dependent] -= 1
+            if indegree[dependent] == 0:
+                heapq.heappush(heap, (original_positions[dependent], dependent))
+    if len(ordered) != len(pending):
+        blockers.append({"kind": "DEPENDENCY_CYCLE", "commits": [s for s in pending if indegree[s] > 0]})
+    if ordered != pending:
+        warnings.append({"kind": "REORDERED_PREREQUISITES", "count": sum(a != b for a,b in zip(ordered,pending))})
+    for item in plan.additions["commits"]:
+        commit = item["sha"]
+        if commit not in selected_set:
+            continue
+        target = plan.payload["target"]
+        if (not item.get("outside_target", False) and
+                subprocess.run(["git", "cat-file", "-e", f"{target}^{{commit}}"],
+                               cwd=repo, stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL).returncode == 0 and
+                subprocess.run(["git", "merge-base", "--is-ancestor", commit, target],
+                               cwd=repo, stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL).returncode != 0):
+            # Legacy additions without an explicit scoped exception still
+            # receive the original review warning.
+            warnings.append({"kind": "ENGINEER_COMMIT_OUTSIDE_TARGET", "sha": commit,
+                             "target": target})
+    for leftover in plan.payload.get("dependency_closure_incomplete", []):
+        if leftover in selected_set:
+            blockers.append({"kind": "UNEXPANDED_DEPENDENCY", "sha": leftover})
+    baseline = plan.payload.get("baseline_warning")
+    if isinstance(baseline, dict) and not baseline.get("acknowledged"):
+        warnings.append({"kind": "PLANNER_BASELINE_WARNING", "detail": baseline})
+    return ordered, blockers, warnings
+
+
+def conflict_diagnosis(repo: Path, worktree: Path, commit: str,
+                       paths: list[str], record: dict | None = None) -> dict:
+    """Capture bounded, local evidence for a failed cherry-pick.
+
+    No model calls and no inferred hard dependencies: a conflict may simply
+    reflect a downstream edit. The source excerpts let an engineer or advisor
+    distinguish that from an actual missing API/semantic prerequisite.
+    """
+    record = record or {}
+    safe_paths = [p for p in paths if p and not p.startswith("-")][:4]
+    def excerpt(*args: str, limit: int = 8000) -> str:
+        try:
+            return git(worktree, *args, check=False)[-limit:]
+        except (OSError, BackportError):
+            return ""
+    return {
+        "classification": "unverified-integration-conflict",
+        "proof_of_missing_prerequisite": False,
+        "source_paths": safe_paths,
+        "upstream_patch_excerpt": excerpt("show", "--format=", "--no-ext-diff",
+                                           "--unified=5", commit, "--", *safe_paths),
+        "conflicted_merge_excerpt": excerpt("diff", "--cc", "--", *safe_paths),
+        "recorded_prerequisites": (record.get("advisor_prerequisites") or [])[:12],
+        "source_evidence": [
+            item for item in (record.get("advisor_consumed_objects") or [])
+            if item.get("kind") == "missing-struct-member"
+        ][:12],
+        "suggested_action": (
+            "Compare upstream patch to downstream source, inspect recorded "
+            "prerequisite evidence and series context, then choose minimum "
+            "required upstream chain, downstream adaptation, or reconsider TAKE. "
+            "Do not infer a missing prerequisite from the conflict alone."
+        ),
+    }
+
+
+def _replay_cherry_pick_status(cp: subprocess.CompletedProcess, unmerged: list[str],
+                               staged: bool) -> str | None:
+    """Distinguish patch application problems from unexpected Git failures.
+
+    None means the cherry-pick produced an applicable staged change. An empty
+    pick is not a merge conflict, while an unexplained nonzero Git exit must
+    stop the exploratory pass rather than produce misleading subsequent results.
+    """
+    if unmerged:
+        return "conflict"
+    message = (cp.stdout + "\n" + cp.stderr).lower()
+    if cp.returncode:
+        if not staged and any(fragment in message for fragment in (
+                "previous cherry-pick is now empty", "the previous cherry-pick is now empty",
+                "nothing to commit", "nothing added to commit", "patch is empty")):
+            return "empty"
+        if "conflict" in message or "could not apply" in message:
+            return "conflict"
+        return "error"
+    return None if staged else "empty"
+
+
+def _reset_replay_worktree(wt: Path) -> None:
+    """Discard a failed/empty pick, never touching the engineer's checkout."""
+    # --no-commit may or may not leave a CHERRY_PICK_HEAD/sequencer behind.
+    # Abort when one exists, then remove partial index/worktree changes. The
+    # temporary worktree is disposable, unlike the actual backport checkout.
+    git(wt, "-c", "core.hooksPath=/dev/null", "cherry-pick", "--abort", check=False)
+    git(wt, "reset", "--hard", "HEAD")
+    git(wt, "clean", "-fd")
+    if git(wt, "status", "--porcelain=v1"):
+        raise BackportError("temporary ICC worktree still dirty after a failed cherry-pick")
+
+
+def simulation(repo: Path, order: list[str], *, commits: dict | None = None) -> dict:
+    """Best-effort, prerequisite-aware replay in a disposable Git worktree.
+
+    Successful commits are accumulated in order. On conflict or empty pick,
+    discard the attempted change and try independent later commits. Explicit
+    consumers of a failed/unreplayed prerequisite are *not* exercised; they
+    are reported as not-tested. All outcomes after a skipped patch are
+    conditional because the temporary tree is only a partial backport.
+    This finds multiple difficulties in one pass without falsely certifying
+    that the full TAKE sequence applies as-is.
+    """
+    result = {"status": "not-run", "commits": [], "reason": None,
+              "mode": "continue-after-conflict", "complete": False,
+              "scan_complete": False}
+    if not order:
+        result.update(status="clean", complete=True, scan_complete=True)
+        return result
+    # Refuse network fetching and remote modifications: this is a local replay only.
+    missing = [s for s in order if subprocess.run(
+        ["git", "cat-file", "-e", f"{s}^{{commit}}"], cwd=repo,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode]
+    if missing:
+        result.update(status="unavailable", reason=(
+            "upstream objects missing in local Git repository; "
+            "fetch linux-stable before checking"), missing=missing[:20])
+        return result
+
+    records = commits or {}
+    failed: set[str] = set()
+    skipped_count = 0
+    directory = Path(tempfile.mkdtemp(prefix="kernel-backport-icc-"))
+    wt = directory / "worktree"
+    added = False
+    try:
+        git(repo, "worktree", "add", "--detach", str(wt), "HEAD")
+        added = True
+        for index, s in enumerate(order):
+            prereqs = records.get(s, {}).get("advisor_prerequisites") or []
+            blocked_by = sorted({item.get("sha") for item in prereqs
+                                 if isinstance(item, dict) and item.get("sha") in failed})
+            if blocked_by:
+                result["commits"].append({
+                    "sha": s, "status": "not-tested", "reason": "failed-prerequisite",
+                    "blocked_by": blocked_by,
+                })
+                failed.add(s)
+                skipped_count += 1
+                continue
+            # Always test independent commits, even after earlier failures.
+            # Later results are explicitly provisional due to skipped patches.
+            conditional = skipped_count > 0
+            cp = subprocess.run([
+                "git", "-c", "core.hooksPath=/dev/null", "cherry-pick", "--no-commit", s
+            ], cwd=wt, capture_output=True, text=True)
+            unmerged = git(wt, "diff", "--name-only", "--diff-filter=U", check=False).splitlines()
+            staged = subprocess.run(["git", "diff", "--cached", "--quiet"], cwd=wt,
+                                    capture_output=True).returncode != 0
+            kind = _replay_cherry_pick_status(cp, unmerged, staged)
+            if kind:
+                entry = {
+                    "sha": s, "status": kind, "files": unmerged,
+                    "detail": (cp.stderr or cp.stdout)[-1000:],
+                    "diagnosis": conflict_diagnosis(repo, wt, s, unmerged,
+                        records.get(s, {})),
+                    "conditional": conditional,
+                }
+                result["commits"].append(entry)
+                # Unknown Git/tool errors may invalidate the remaining probes.
+                # Preserve the partial findings but do not claim exhaustive testing.
+                if kind == "error":
+                    result["commits"].extend({
+                        "sha": later, "status": "not-tested", "reason": "replay-tool-error"
+                    } for later in order[index + 1:])
+                    result.update(status="error", reason=(
+                        "exploratory Git cherry-pick failed unexpectedly at " + s[:12]
+                        + "; see replay.commits for the diagnostic"))
+                    return result
+                _reset_replay_worktree(wt)
+                failed.add(s)
+                skipped_count += 1
+                continue
+            git(wt, "-c", "user.name=kernel-backport ICC",
+                "-c", "user.email=icc@example.invalid",
+                "-c", "core.hooksPath=/dev/null", "commit", "--quiet", "-m", f"ICC {s}")
+            result["commits"].append({
+                "sha": s, "status": "clean", "conditional": conditional,
+            })
+        result.update(status="blocked" if failed else "clean",
+                      complete=not failed, scan_complete=True,
+                      skipped_commits=skipped_count)
+        return result
+    finally:
+        if added:
+            git(repo, "worktree", "remove", "--force", str(wt), check=False)
+        shutil.rmtree(directory, ignore_errors=True)
+
+
+
+def worksheet_integration_lines(icc: dict) -> list[str]:
+    """Render the *current* ICC result, not the planner's original TAKE replay.
+
+    The best-effort replay may skip failed picks and test later commits on a
+    partial tree. Count unresolved explicit prerequisites as untested and
+    identify all detected failures; later outcomes remain conditional.
+    """
+    replay = icc["replay"]
+    statuses = collections.Counter(entry["status"] for entry in replay.get("commits", []))
+    pending = icc["take_pending_total"]
+    untested = pending - sum(v for k, v in statuses.items() if k != "not-tested")
+    # A skipped/unavailable replay has no per-commit entries. A best-effort
+    # replay reports every attempted commit plus explicit skipped dependents.
+    if untested < 0:
+        raise BackportError("ICC replay has more attempted commits than pending TAKEs")
+    conflicts = statuses["conflict"]
+    empty = statuses["empty"]
+    replay_errors = statuses["error"]
+    conditional = sum(1 for entry in replay.get("commits", [])
+                      if entry.get("conditional") and entry["status"] != "not-tested")
+    dependency_blocked = sum(1 for entry in replay.get("commits", [])
+                             if entry.get("reason") == "failed-prerequisite")
+    logical = icc["logical_blockers"]
+    advisor_blockers = icc.get("advisor_readiness_blockers", [])
+    failures = [entry for entry in replay.get("commits", [])
+                if entry["status"] in ("conflict", "empty", "error")]
+    blockers = len(logical) + len(advisor_blockers) + len(failures)
+    status = replay["status"]
+    if logical or advisor_blockers or status == "blocked":
+        summary = "BLOCKED"
+    elif status == "clean":
+        summary = "READY"
+    else:
+        summary = status.upper()
+    total = icc["take_total"]
+    applied = icc["take_applied_total"]
+    if applied < 0 or pending + applied != total:
+        raise BackportError("ICC selected, pending and applied TAKE counts disagree")
+    lines = [
+        f"take-integration: {summary} (TAKE={total}, already-applied={applied}, "
+        f"clean={statuses['clean']})\n",
+        f"take-integration-counts: conflict={conflicts}, empty={empty}, "
+        f"not-tested={untested}\n",
+        f"take-integration-counts: conditional={conditional}, blockers={blockers}\n",
+        "take-integration-note: Current ICC, exploratory only; not a build/boot validation\n",
+    ]
+    if dependency_blocked:
+        lines.append(f"take-integration-note: {dependency_blocked} "
+                     f"commit{'s' if dependency_blocked != 1 else ''} not tested "
+                     "because at least one known prerequisite failed or was skipped\n")
+    if conditional:
+        lines.append(f"take-integration-note: {conditional} results conditional "
+                     "on earlier failed commits being omitted from the temporary replay\n")
+    if status == "not-run":
+        lines.append("take-integration-note: Replay not run; pending commits are untested\n")
+    elif status in ("error", "unavailable"):
+        reason = str(replay.get("reason") or "replay could not run").replace("\n", " ").replace("\r", " ")
+        lines.append(f"take-integration-note: {reason[:300]}\n")
+    if advisor_blockers:
+        lines.append(f"take-integration-note: {len(advisor_blockers)} unresolved planner "
+                     "advisor readiness issue(s); engineer decisions required\n")
+    for item in advisor_blockers:
+        lines.append("  integration-blocker: " + item.get("kind", "ADVISOR_READINESS")
+                     + (" " + item["sha"][:12] if item.get("sha") else "") + "\n")
+    for item in logical[:30]:
+        kind = item.get("kind", "LOGICAL_BLOCKER")
+        commit = item.get("sha", "")
+        lines.append("  integration-blocker: " + kind + (" " + commit[:12] if commit else "") + "\n")
+    # List *all* observed integration difficulties, not merely the first 30.
+    # The detailed diagnostics for each commit remain in icc.json.
+    for item in failures:
+        lines.append("  integration-blocker: TAKE_REPLAY_" + item["status"].upper()
+                     + " " + item["sha"][:12]
+                     + (" (conditional)" if item.get("conditional") else "") + "\n")
+    # Generated ICC header prose is safe to wrap. Preserve every source commit
+    # record and engineer field below the BACKPORT WORKSHEET heading verbatim.
+    return wrap_text("".join(lines)).splitlines(keepends=True)
+
+
+def refresh_worksheet_integration(plan: Plan, icc: dict) -> None:
+    """Atomically replace only the worksheet's generated integration header.
+
+    Everything following BACKPORT WORKSHEET (including advisor evidence and
+    engineer overrides) is preserved byte-for-byte. The caller holds the
+    existing plan lock. A concurrent human edit is detected before replacement.
+    """
+    previous = plan.worksheet.read_bytes()
+    lines = previous.decode("utf-8").splitlines(keepends=True)
+    marks = [i for i, line in enumerate(lines)
+             if line.rstrip("\r\n") == "BACKPORT WORKSHEET (oldest first)"]
+    if len(marks) != 1:
+        raise BackportError("worksheet header is missing or ambiguous")
+    header_end = marks[0]
+    matches = [i for i in range(header_end)
+               if lines[i].startswith("take-integration:")]
+    if len(matches) > 1:
+        raise BackportError("multiple take-integration summaries in worksheet header")
+    if matches:
+        start = matches[0]
+        end = start + 1
+        while end < header_end and (
+                lines[end].startswith("take-integration-note:") or
+                lines[end].startswith("take-integration-counts:") or
+                lines[end].startswith("  integration-blocker:") or
+                lines[end].startswith("      ")):
+            end += 1
+    else:
+        # Legacy plans and small fixture worksheets may omit the original
+        # summary; insert it by the status header, otherwise before the section.
+        start = next((i for i in range(header_end)
+                      if lines[i].startswith("status:")), header_end)
+        end = start
+    newline = "\r\n" if b"\r\n" in previous and b"\n" not in previous.replace(b"\r\n", b"") else "\n"
+    replacement = [line.replace("\n", newline) for line in worksheet_integration_lines(icc)]
+    # The original planner could emit additional overlong *informational*
+    # header fields. Normalize that header as well, without touching even one
+    # byte of the parseable commit records or subsequent worksheet sections.
+    header = "".join(lines[:start] + replacement + lines[end:header_end])
+    header = wrap_text(header)
+    updated = (header + "".join(lines[header_end:])).encode("utf-8")
+    if updated == previous:
+        return
+    if plan.worksheet.read_bytes() != previous:
+        raise BackportError("worksheet changed during ICC summary update")
+    atomic_bytes(plan.worksheet, updated)
+
+
+def check(plan: Plan, repo: Path, *, replay: bool = True) -> int:
+    state = load_state(plan)
+    require_open_execution(state)
+    git_clean(repo)
+    if state["phases"]:
+        if state.get("repo") != str(repo) or state.get("branch") != git(repo,"symbolic-ref","--short","HEAD"):
+            raise BackportError("execution state belongs to another repository/branch")
+        current_verified_head(state, repo)
+    else:
+        if git(repo, "rev-parse", "HEAD") != plan.baseline:
+            raise BackportError(f"HEAD does not match plan baseline {plan.baseline}; choose matching branch")
+    applied, _ = existing_phase_entries(state, repo)
+    take_total = sum(plan.effective(s) == "TAKE" for s in plan.order)
+    take_applied = sum(plan.effective(s) == "TAKE" and s in applied for s in plan.order)
+    ordered, blockers, warnings = check_graph(plan, repo, applied)
+    advisor_blockers = plan.advisor_readiness_blockers()
+    try:
+        result = simulation(repo, ordered, commits=plan.commits) if replay and not blockers else {"status": "not-run", "commits": [], "reason": "logical blockers or --no-replay"}
+    except (OSError, BackportError) as exc:
+        result = {"status": "error", "reason": str(exc), "commits": []}
+    attestation = {
+        "schema": 1, "plan_sha256": plan.plan_digest, "decision_revision": plan.revision(),
+        "repo": str(repo), "branch": git(repo,"symbolic-ref","--short","HEAD"),
+        "checked_head": git(repo, "rev-parse", "HEAD"),
+        "checked_at_unix": int(time.time()),
+        "take_total": take_total, "take_applied_total": take_applied,
+        "take_pending_total": take_total - take_applied,
+        "pending_order": ordered, "logical_blockers": blockers,
+        "advisor_readiness_blockers": advisor_blockers,
+        "warnings": warnings,
+        "engineer_target_exceptions": [
+            {"sha": item["sha"], "target": plan.payload["target"],
+             "reason": item["reason"]}
+            for item in plan.additions["commits"] if item.get("outside_target", False)],
+        "omitted_fixes": [w["trailer"] for w in warnings if w["kind"] == "OMITTED_FIX"],
+        "replay": result,
+    }
+    atomic_json(plan.iccpath, attestation)
+    refresh_worksheet_integration(plan, attestation)
+    print(f"ICC revision: {plan.revision()[:12]}")
+    print(f"TAKE: {attestation['take_total']} (pending: {attestation['take_pending_total']}, already applied: {take_applied})")
+    print(f"Logical blockers: {len(blockers)}, warnings: {len(warnings)}")
+    if attestation["engineer_target_exceptions"]:
+        print(f"Explicit outside-target commits: {len(attestation['engineer_target_exceptions'])}")
+    print(f"Advisor readiness blockers: {len(advisor_blockers)}")
+    for b in advisor_blockers[:25]:
+        print("  ADVISOR BLOCK: " + b["kind"] +
+              (" " + b["sha"][:12] if b.get("sha") else "") +
+              (" - " + b["reason"] if b.get("reason") else ""))
+    if len(advisor_blockers) > 25:
+        print(f"  ... {len(advisor_blockers) - 25} additional advisor blocker(s) in ICC report")
+    print(f"Exploratory replay: {result['status']} (not a build/boot validation)")
+    for b in blockers[:15]:
+        print("  BLOCK: " + json.dumps(b, sort_keys=True))
+    # Surface Fixes: provenance warnings without turning them into blockers.
+    for w in [w for w in warnings if w["kind"].startswith(("FIXES_", "KNOWN_FIX_", "OMITTED_FIX"))][:20]:
+        print("  WARN: " + json.dumps(w, sort_keys=True))
+    if result["status"] in ("blocked", "error"):
+        failures = [c for c in result["commits"]
+                    if c["status"] in ("conflict", "empty", "error")]
+        dependent = sum(c.get("reason") == "failed-prerequisite"
+                        for c in result["commits"])
+        conditional = sum(bool(c.get("conditional")) for c in result["commits"])
+        print(f"  Replay findings: {len(failures)} application difficulties, "
+              f"{dependent} known-dependent commits untested, "
+              f"{conditional} conditional outcomes")
+        for entry in failures:
+            paths = ", ".join(entry.get("files") or [])
+            print(f"  {entry['status'].upper()}: {entry['sha'][:12]}"
+                  + (f" [{paths}]" if paths else "")
+                  + (" (conditional)" if entry.get("conditional") else ""))
+        print("  Full conflict diagnosis: .kernel-backport/icc.json and review --priority critical")
+    print(f"ICC report: {plan.iccpath}")
+    return 2 if blockers or advisor_blockers else 0
+
+
+def validated_icc(plan: Plan, repo: Path) -> dict:
+    try:
+        icc = json.loads(plan.iccpath.read_text())
+    except (OSError, ValueError):
+        raise BackportError("ICC missing; run 'kernel-backport check' after each plan revision")
+    if (icc.get("schema") != 1 or icc.get("plan_sha256") != plan.plan_digest
+            or icc.get("decision_revision") != plan.revision() or icc.get("repo") != str(repo)
+            or icc.get("branch") != git(repo, "symbolic-ref", "--short", "HEAD")):
+        raise BackportError("ICC is stale for this plan/branch/decision revision; rerun check")
+    if "advisor_readiness_blockers" not in icc:
+        raise BackportError("ICC predates advisor readiness checks; rerun kernel-backport check")
+    outstanding = plan.advisor_readiness_blockers()
+    if outstanding:
+        raise BackportError(f"{len(outstanding)} unresolved advisor readiness blocker(s); "
+                            "review the model disagreements, decide TAKE/SKIP with --reason, "
+                            "and rerun check")
+    if icc["advisor_readiness_blockers"]:
+        raise BackportError("ICC records unresolved advisor readiness blockers; rerun check")
+    if icc.get("logical_blockers"):
+        raise BackportError("ICC found missing prerequisites or other logical blockers; resolve them first")
+    if icc.get("replay", {}).get("status") == "error":
+        raise BackportError("ICC replay encountered a tool error; rerun check")
+    return icc
+
+
+def phase_journal(phase: dict) -> dict | None:
+    path = Path(phase["journal"])
+    if path.is_file():
+        return json.loads(path.read_text())
+    return None
+
+
+def phase_done(phase: dict) -> bool:
+    journal = phase_journal(phase)
+    if not journal:
+        return not phase["order"]
+    return journal.get("cursor") == len(phase["order"]) and not journal.get("blocked")
+
+
+def current_verified_head(state: dict, repo: Path) -> None:
+    for phase in state["phases"]:
+        journal = phase_journal(phase)
+        if journal:
+            if journal.get("plan_sha256") != sha(Path(phase["plan"]).read_bytes()):
+                raise BackportError("execution journal/phase plan digest mismatch")
+            if journal.get("repo") != str(repo):
+                raise BackportError("execution journal refers to another repository")
+    for phase in reversed(state["phases"]):
+        journal = phase_journal(phase)
+        if journal:
+            if git(repo, "rev-parse", "HEAD") != journal["last_head"]:
+                raise BackportError("HEAD advanced since journal (possibly manual conflict resolution); resume previous phase before revising the plan")
+            break
+
+
+def new_phase(plan: Plan, repo: Path, state: dict, icc: dict) -> dict | None:
+    done, _ = existing_phase_entries(state, repo)
+    ordered, blockers, _ = check_graph(plan, repo, done)
+    if blockers:
+        raise BackportError("new logical blockers appeared since ICC; rerun check")
+    if not ordered:
+        return None
+    idx = len(state["phases"]) + 1
+    path = plan.directory / ".kernel-backport" / f"phase_{idx:03d}"
+    path.mkdir(mode=0o700, parents=True, exist_ok=False)
+    subset = {}
+    for s in ordered:
+        rec = json.loads(json.dumps(plan.commits[s]))
+        rec["advisor_original_decision"] = rec["advisor_decision"]
+        rec["advisor_decision"] = "TAKE"  # frozen engineer-approved execution snapshot
+        rec["selected"] = True
+        rec["match"] = {"status": "missing"}
+        subset[s] = rec
+    snapshot = {
+        "downstream": git(repo,"rev-parse","HEAD"), "replay_start": git(repo,"rev-parse","HEAD"),
+        "target": plan.payload["target"], "order": ordered, "commits": subset,
+        "source_plan_sha256": plan.plan_digest, "decision_revision": plan.revision(),
+        "project_id": state["project_id"],
+    }
+    p = path / "execution_plan.json"
+    atomic_json(p, snapshot)
+    phase = {
+        "id": idx, "revision": plan.revision(), "start_head": snapshot["downstream"],
+        "project_id": state["project_id"],
+        "plan": str(p), "journal": str(path / "journal.json"),
+        "order": ordered, "superseded": False,
+    }
+    state["phases"].append(phase)
+    atomic_json(plan.statepath, state)
+    return phase
+
+
+def hydrate_engineer_additions(plan: Plan, repo: Path, upstream_reference: Path) -> None:
+    """Make engineer-added local upstream commits visible to the reference engine.
+
+    A long-lived, intentionally unrefreshed reference clone can lag behind the
+    user's local upstream remote. Only copy the explicitly added Git objects;
+    never contact the network or update the user's working tree.
+    """
+    if not (upstream_reference / ".git").exists():
+        return  # ReferenceManager creates a fresh clone during the executor run.
+    for item in plan.additions["commits"]:
+        commit = item["sha"]
+        if subprocess.run(["git", "cat-file", "-e", f"{commit}^{{commit}}"],
+                          cwd=upstream_reference, stdout=subprocess.DEVNULL,
+                          stderr=subprocess.DEVNULL).returncode == 0:
+            continue
+        fetch = subprocess.run(["git", "-c", "protocol.file.allow=always", "fetch",
+                                "--no-tags", "--no-write-fetch-head", str(repo), commit],
+                               cwd=upstream_reference, text=True, capture_output=True)
+        if fetch.returncode:
+            raise BackportError(
+                f"cannot import engineer-added {commit[:12]} into local upstream "
+                f"reference {upstream_reference}: {fetch.stderr.strip()}")
+
+
+def execute(plan: Plan, repo: Path, args, *, resume: bool = False) -> int:
+    git_clean(repo)
+    icc = validated_icc(plan, repo)
+    state = load_state(plan)
+    require_open_execution(state)
+    branch = git(repo, "symbolic-ref", "--short", "HEAD")
+    if state["phases"]:
+        if state.get("repo") != str(repo) or state.get("branch") != branch:
+            raise BackportError("state belongs to a different repository or branch")
+        if state.get("project_id") != args.project_id:
+            raise BackportError("execution state belongs to another project ID")
+    else:
+        if git(repo,"rev-parse","HEAD") != plan.baseline:
+            raise BackportError("initial execution must start at planner baseline")
+        state.update(repo=str(repo), branch=branch, project_id=args.project_id)
+    if not state["phases"]:
+        phase = new_phase(plan, repo, state, icc)
+    else:
+        phase = state["phases"][-1]
+        if phase["revision"] != plan.revision():
+            current_verified_head(state, repo)
+            phase["superseded"] = True
+            atomic_json(plan.statepath, state)
+            phase = new_phase(plan, repo, state, icc)
+        elif phase_done(phase):
+            current_verified_head(state, repo)
+            print("All TAKE commits in this plan revision have been processed.")
+            return 0
+    if phase is None:
+        print("No pending TAKE commits in this plan revision.")
+        return 0
+    if resume and not phase_journal(phase):
+        print("Resume: no journal yet; starting first attempt")
+    ref_root = (args.reference_root or os.environ.get("KERNEL_BACKPORTER_REFERENCE_ROOT")
+                or str(Path(os.environ.get("XDG_CACHE_HOME", str(Path.home() / ".cache"))).expanduser()
+                       / "kernel-backporter" / "reference"))
+    hydrate_engineer_additions(plan, repo, Path(ref_root).expanduser().resolve() / "linux-stable")
+    command = [sys.executable, str(EXECUTOR), "--plan", phase["plan"],
+               "--repo", str(repo), "--journal", phase["journal"],
+               "--reference-root", ref_root,
+               "--report-dir", str(plan.directory / ".kernel-backport" / "reports"),
+               "--project-id", args.project_id, "--max-attempts", str(args.max_attempts)]
+    if args.upstream_url:
+        command += ["--upstream-url", args.upstream_url]
+    if args.downstream_url:
+        command += ["--downstream-url", args.downstream_url]
+    if args.skip_refresh:
+        command.append("--skip-refresh")
+    print(f"Execution phase {phase['id']}, plan revision {plan.revision()[:12]}", flush=True)
+    completed = subprocess.run(command)
+    return completed.returncode
+
+
+def finished_record(state: dict) -> dict | None:
+    """The finished snapshot is a terminal *tool* state, not a Git restriction."""
+    record = state.get("finished")
+    if record is None:
+        return None
+    if (not isinstance(record, dict) or record.get("schema") != 1
+            or not valid_sha(record.get("final_head"))
+            or not isinstance(record.get("manifest"), str)):
+        raise BackportError("invalid finished execution record")
+    return record
+
+
+def require_open_execution(state: dict) -> None:
+    if finished_record(state) is not None:
+        raise BackportError(
+            "plan is finished; execution and selection are closed. "
+            "Manage the completed patch series with Git; retain the archived plan "
+            "for MR review")
+
+
+def markdown_cell(value: object) -> str:
+    return str(value if value is not None else "").replace("|", "\\|").replace("\n", " ").replace("\r", " ")
+
+
+def finish(plan: Plan, repo: Path) -> int:
+    """Handoff a complete, consistent execution to Git without changing commits.
+
+    All validation precedes the first write. The marker is written LAST so a
+    failed report write does not leave the plan falsely marked finished.
+    """
+    state = load_state(plan)
+    prior = finished_record(state)
+    if prior is not None:
+        print(f"Already finished: {prior['final_head'][:12]}")
+        print(f"Handoff manifest: {prior['manifest']}")
+        return 0
+    git_clean(repo)
+    if not state["phases"]:
+        raise BackportError("cannot finish: no execution phase has started")
+    branch = git(repo, "symbolic-ref", "--short", "HEAD")
+    if state.get("repo") != str(repo) or state.get("branch") != branch:
+        raise BackportError("cannot finish: repository/branch differs from execution state")
+    if not state.get("project_id"):
+        raise BackportError("cannot finish: missing execution project identity")
+    # A completed execution must still be based on the approved selection.
+    icc = validated_icc(plan, repo)
+    current_verified_head(state, repo)
+    last_phase = state["phases"][-1]
+    # The worksheet may change after the final pick to explain an excluded
+    # candidate. No new phase is needed when the latest TAKE set is already
+    # accounted for; the current ICC and complete ledger are the real gates.
+    if not phase_journal(last_phase) or (not last_phase.get("superseded") and not phase_done(last_phase)):
+        raise BackportError("cannot finish: execution is incomplete or blocked; resume first")
+    # Verify phase and journal snapshots. Superseded phases may be incomplete,
+    # but only the current revision is eligible for a final handoff.
+    attempts = {}
+    phase_records = []
+    preceding_head = plan.baseline
+    for phase in state["phases"]:
+        snapshot = Path(phase["plan"])
+        journal_path = Path(phase["journal"])
+        if not snapshot.is_file() or not journal_path.is_file():
+            raise BackportError("cannot finish: missing execution snapshot or journal")
+        frozen = json.loads(snapshot.read_text(encoding="utf-8"))
+        journal = phase_journal(phase)
+        if not isinstance(journal, dict) or frozen.get("order") != phase.get("order"):
+            raise BackportError("cannot finish: execution snapshot/order mismatch")
+        if (journal.get("plan_sha256") != sha(snapshot.read_bytes())
+                or journal.get("repo") != str(repo)
+                or journal.get("branch") != branch
+                or journal.get("project_id") != state["project_id"]
+                or journal.get("baseline") != phase.get("start_head")
+                or phase.get("start_head") != preceding_head):
+            raise BackportError("cannot finish: execution journal identity/chain mismatch")
+        cursor = journal.get("cursor")
+        entries = journal.get("entries")
+        if (type(cursor) is not int or not isinstance(entries, list)
+                or not 0 <= cursor <= len(phase["order"])
+                or len(entries) != cursor):
+            raise BackportError("cannot finish: journal cursor/entries are inconsistent")
+        for idx, entry in enumerate(entries):
+            if (not isinstance(entry, dict)
+                    or entry.get("sha") != phase["order"][idx]
+                    or entry.get("status") not in
+                    ("APPLIED", "APPLIED_MANUALLY", "ALREADY_PRESENT",
+                     "SKIPPED_POLICY", "SKIPPED_ENGINEER")):
+                raise BackportError("cannot finish: invalid journal entry/order")
+            if entry["status"] in ("APPLIED", "APPLIED_MANUALLY") and not valid_sha(entry.get("downstream_sha")):
+                raise BackportError("cannot finish: applied journal entry lacks downstream SHA")
+            attempts[entry["sha"]] = {"status": entry["status"],
+                                      "downstream_sha": entry.get("downstream_sha"),
+                                      "phase": phase["id"]}
+        latest_applied = next((entry["downstream_sha"] for entry in reversed(entries)
+                               if entry["status"] in ("APPLIED", "APPLIED_MANUALLY")),
+                              phase["start_head"])
+        if journal.get("last_head") != latest_applied:
+            raise BackportError("cannot finish: journal last HEAD does not match recorded commits")
+        if not phase.get("superseded") and (cursor != len(phase["order"]) or journal.get("blocked")):
+            raise BackportError("cannot finish: active execution phase is incomplete")
+        preceding_head = journal["last_head"]
+        phase_records.append({"id": phase["id"], "superseded": bool(phase.get("superseded")),
+                              "revision": phase["revision"], "attempts": cursor,
+                              "total": len(phase["order"]),
+                              "plan": str(snapshot.relative_to(plan.directory)),
+                              "plan_sha256": sha(snapshot.read_bytes()),
+                              "journal": str(journal_path.relative_to(plan.directory)),
+                              "journal_sha256": sha(journal_path.read_bytes())})
+    selected = [commit for commit in plan.order if plan.effective(commit) == "TAKE"]
+    complete = {"APPLIED", "APPLIED_MANUALLY", "ALREADY_PRESENT"}
+    missing = [commit for commit in selected if attempts.get(commit, {}).get("status") not in complete]
+    if missing:
+        raise BackportError(f"cannot finish: {len(missing)} selected TAKE(s) not integrated, first {missing[0][:12]}")
+    # Check the branch and every applied downstream commit before handoff.
+    final_head = git(repo, "rev-parse", "HEAD")
+    if final_head != phase_journal(last_phase).get("last_head"):
+        raise BackportError("cannot finish: HEAD does not match the final execution journal")
+    for commit in selected:
+        ds = attempts[commit].get("downstream_sha")
+        if ds and subprocess.run(["git", "merge-base", "--is-ancestor", ds, "HEAD"],
+                                 cwd=repo, stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL).returncode:
+            raise BackportError(f"cannot finish: managed commit {ds[:12]} is not reachable")
+    ledger = []
+    for commit in plan.order:
+        rec = plan.commits[commit]
+        override = plan.human_overrides.get(commit)
+        automatic = plan.auto_overrides.get(commit)
+        origin = "engineer" if override else "automatic" if automatic else "advisor"
+        rationale = ((override or automatic or {}).get("rationale") or
+                     rec.get("advisor_rationale") or "")
+        item = {"upstream_sha": commit, "subject": rec.get("subject", ""),
+                "decision": plan.effective(commit),
+                "advisor_decision": rec.get("advisor_decision"),
+                "decision_source": origin, "rationale": rationale,
+                "advisor_rationale": rec.get("advisor_rationale", ""),
+                "automatic_provenance": automatic.get("source") if automatic else None,
+                "execution": attempts.get(commit)}
+        ledger.append(item)
+    manifest = {
+        "schema": 1, "tool_version": VERSION, "finished_at_unix": int(time.time()),
+        "project_id": state["project_id"], "repo": str(repo), "branch": branch,
+        "downstream_baseline": plan.baseline, "final_head": final_head,
+        "source_plan_sha256": plan.plan_digest,
+        "worksheet_sha256": sha(plan.worksheet.read_bytes()),
+        "decision_revision": plan.revision(),
+        "icc_sha256": sha(plan.iccpath.read_bytes()),
+        "icc_replay_status": icc.get("replay", {}).get("status"),
+        "icc_warnings": icc.get("warnings", []),
+        "icc_outside_target_exceptions": icc.get("engineer_target_exceptions", []),
+        "counts": {kind: sum(x["decision"] == kind for x in ledger) for kind in DECISIONS},
+        "phases": phase_records, "decisions": ledger,
+    }
+    summary = ["# kernel-backport: completed execution review record", "",
+               f"Project: `{state['project_id']}`  ",
+               f"Recorded branch: `{branch}`  ",
+               f"Baseline: `{plan.baseline}`  ",
+               f"Handoff HEAD: `{final_head}`  ",
+               f"Decision revision: `{plan.revision()}`  ",
+               f"Finished using kernel-backport {VERSION}.  ", "",
+               "This is a historical construction record. After `finish`, Git owns",
+               "the patch series: amended or rebased downstream SHAs need not match",
+               "the recorded journal. The archived worksheet remains the authority",
+               "for the original engineering decisions and rationales.", "",
+               f"Selections: {len(selected)} TAKE, {manifest['counts']['SKIP']} SKIP, "
+               f"{manifest['counts']['REVIEW']} REVIEW.", "",
+               "## Retained changes and integration provenance", "",
+               "| Upstream | Downstream at handoff | Integration | Subject | Selection rationale |",
+               "| --- | --- | --- | --- | --- |"]
+    for item in ledger:
+        if item["decision"] == "TAKE":
+            execution = item["execution"] or {}
+            summary.append("| " + " | ".join((
+                f"`{item['upstream_sha']}`",
+                f"`{execution['downstream_sha']}`" if execution.get("downstream_sha") else "Already present",
+                markdown_cell(execution.get("status", "")),
+                markdown_cell(item["subject"]),
+                markdown_cell(item["rationale"]),
+            )) + " |")
+    summary.extend(["", "## Explicit engineer and automatic selections", "",
+                    "Includes non-TAKE dispositions important for explaining MR scope.", "",
+                    "| Upstream | Decision | Source | Reason |",
+                    "| --- | --- | --- | --- |"])
+    for item in ledger:
+        if item["decision_source"] != "advisor":
+            summary.append("| " + " | ".join((
+                f"`{item['upstream_sha']}`", item["decision"],
+                item["decision_source"], markdown_cell(item["rationale"]))) + " |")
+    summary.extend(["", "## Execution phases", "",
+                    "| Phase | Attempts | Superseded | Journal |", "| --- | --- | --- | --- |"])
+    for phase in phase_records:
+        summary.append(f"| {phase['id']} | {phase['attempts']}/{phase['total']} | "
+                       f"{'yes' if phase['superseded'] else 'no'} | `{phase['journal']}` |")
+    summary.extend(["", "## Review limitations", "",
+                    "- `finish` checks the journal, Git history and selection completeness; it",
+                    "  does not certify kernel builds, boots, kABI or MR approval.",
+                    "- The frozen worksheet and original planner JSON remain available",
+                    "  for full advisor evidence, dependencies, fixes, and excluded candidates.",
+                    "- The journal's downstream SHAs are authoritative **at handoff**,",
+                    "  not after later manual changes to the patch series.", ""])
+    report_path = plan.directory / ".kernel-backport" / "finish-review.md"
+    manifest_path = plan.directory / ".kernel-backport" / "finish.json"
+    if report_path.exists() or manifest_path.exists():
+        raise BackportError("finish artifacts already exist without a final marker; inspect them before retrying")
+    report = "\n".join(summary).encode("utf-8")
+    manifest["review_report"] = str(report_path.relative_to(plan.directory))
+    manifest["review_report_sha256"] = sha(report)
+    atomic_bytes(report_path, report)
+    atomic_json(manifest_path, manifest)
+    state["finished"] = {"schema": 1, "final_head": final_head,
+                         "manifest": str(manifest_path.relative_to(plan.directory)),
+                         "decision_revision": plan.revision(),
+                         "finished_at_unix": manifest["finished_at_unix"]}
+    atomic_json(plan.statepath, state)
+    print(f"Finished: {len(selected)} selected TAKE(s) accounted for; handoff HEAD {final_head[:12]}")
+    print("Execution is closed; use Git for subsequent MR revisions.")
+    print(f"Review report: {report_path}")
+    print(f"Handoff manifest: {manifest_path}")
+    return 0
+
+
+def refresh_review_reports(plan: Plan) -> dict:
+    icc = _fresh_icc(plan.directory, plan.plan_digest, plan.revision())
+    report = build_queues(plan.payload, plan.overrides,
+                          {s: plan.commits[s] for s in plan.order
+                           if s not in plan.base_commits}, plan.order,
+                          icc=icc, plan_sha256=plan.plan_digest,
+                          decision_revision=plan.revision())
+    attach_cached_assessments(plan, report, icc)
+    write_reports(plan.directory, report)
+    return report
+
+
+def refresh_review_reports_best_effort(directory: Path) -> None:
+    """Never roll back a valid engineer decision if a derived report fails."""
+    try:
+        refresh_review_reports(Plan(directory))
+    except (OSError, ValueError) as exc:
+        print(f"WARNING: unable to refresh review queues: {exc}", file=sys.stderr)
+
+
+def review(plan: Plan, priority: str | None = None,
+           show_all: bool = False, fmt: str = "text", *,
+           assess: bool = False, assess_model: str = "",
+           assess_limit: int = 0, repo: Path | None = None,
+           features: bool = False, assess_features: bool = False,
+           feature_limit: int = 0, retry_invalid: bool = False,
+           feature_model: str = "", feature_summary_model: str = "") -> int:
+    """Recompute derived P0-P3 priorities without altering engineer decisions.
+
+    Default: show P0 and P1, summarize P2 and P3. The original worksheet
+    remains authoritative; an ICC is required to certify consistency.
+    """
+    report = refresh_review_reports(plan)
+    chosen = (["p0", "p1", "p2", "p3"] if show_all else
+              [priority] if priority else ["p0", "p1"])
+    if features or assess_features:
+        icc = _fresh_icc(plan.directory, plan.plan_digest, plan.revision())
+        if assess_features and (not icc or (icc.get("replay") or {}).get("status") not in ("blocked", "clean")):
+            raise BackportError("feature assessment requires a current full ICC; "
+                                "run kernel-backport check without --no-replay")
+        chosen_priorities = (["p0", "p1", "p2", "p3"] if show_all else
+                             [priority] if priority else ["p0"])
+        groups = build_features(plan, report, priorities=chosen_priorities)
+        planning_model = str((plan.payload.get("advisor") or {}).get("model") or "gpt-6.1-terra")
+        model, summary_model = resolve_feature_models(
+            planning_model, feature_model=feature_model,
+            summary_model=feature_summary_model, legacy_assess_model=assess_model)
+        if assess_features:
+            try:
+                stats = assess_feature_groups(plan, groups, report, icc,
+                                               repo or repo_arg(None),
+                                               model=model, segment_model=summary_model,
+                                               limit=feature_limit,
+                                               retry_invalid=retry_invalid)
+            except ValueError as exc:
+                raise BackportError(str(exc)) from exc
+            print(f"Feature assessments: {stats['available']} available, "
+                  f"{stats['new_assessments']} newly generated. "
+                  "No worksheet decisions changed.")
+        else:
+            attach_feature_cache(plan, groups, report, icc, model=model,
+                                 summary_model=summary_model)
+        write_feature_reports(plan.directory, groups)
+        if fmt == "json":
+            print(json.dumps({"schema": FEATURE_SCHEMA_VERSION, "features": groups},
+                             indent=2, sort_keys=True))
+        else:
+            print(feature_text(groups))
+            print(f"Reports: {plan.directory}/review-features.txt and review-features.json")
+        return 0
+    if assess:
+        icc = _fresh_icc(plan.directory, plan.plan_digest, plan.revision())
+        if not icc or (icc.get("replay") or {}).get("status") == "not-run":
+            raise BackportError("patch assessment requires a current full ICC; "
+                                "run kernel-backport check without --no-replay")
+        # Billable only when explicitly requested. With no --priority, assess
+        # only the critical TAKE set, not the entire P0/P1 display.
+        assess_priorities = [priority] if priority else ["p0"]
+        model = assess_model or str((plan.payload.get("advisor") or {}).get("model") or "")
+        try:
+            stats = assess_queues(plan, report, icc,
+                                  repo or repo_arg(None), priorities=assess_priorities,
+                                  model=model, limit=assess_limit)
+        except ValueError as exc:
+            # A partially completed batch is still cached and may be resumed.
+            refresh_review_reports(plan)
+            raise BackportError(str(exc)) from exc
+        write_reports(plan.directory, report)
+        print(f"Patch-grounded assessments: {stats['available']} available, "
+              f"{stats['new_assessments']} newly generated. "
+              "No worksheet decisions changed.")
+    if fmt == "json":
+        print(json.dumps({"summary": report["summary"],
+                          "triage_summary": report["triage_summary"],
+                          "selected_take": report["selected_take"],
+                          "icc_current": report["icc_current"],
+                          "queues": {p: report["queues"][p] for p in chosen}},
+                         indent=2, sort_keys=True))
+    else:
+        counts = report["summary"]
+        print("Review priorities: P0 critical={p0}, P1 high={p1}, "
+              "P2 normal={p2}, P3 deferred={p3}".format(**counts))
+        if not report["icc_current"]:
+            print("WARNING: ICC is not current; P0 may be incomplete. "
+                  "Run kernel-backport check --no-replay.")
+        for p in chosen:
+            print(render_text(report, p))
+        if not show_all and priority is None:
+            print("P2 NORMAL: {p2} and P3 DEFERRED: {p3} hidden; "
+                  "use --priority normal|deferred or --all".format(**counts))
+        print(f"Reports: {plan.directory}/review-p[0-3].txt and review-queues.json")
+    return 0
+
+
+
+def condition(plan: Plan, repo: Path, args) -> int:
+    """Opt-in billable analysis plus explicitly authorized automated SKIPs.
+
+    The planner, kernel repository, branch, index and manual decisions remain
+    unchanged. Automatic worksheet choices are a separate provenance class.
+    """
+    if args.max_rounds < 1:
+        raise BackportError("--max-rounds must be >= 1")
+    if args.max_new_features < 0 or args.max_api_requests < 0:
+        raise BackportError("conditioning request/feature limits must be >= 0")
+    if args.retry_invalid and not args.assess:
+        raise BackportError("--retry-invalid requires --assess")
+    if args.auto_skip_disagreements and not args.allow_unresolved:
+        raise BackportError("--auto-skip-disagreements requires --allow-unresolved")
+    if args.max_new_features and not args.assess:
+        raise BackportError("--max-new-features requires --assess")
+    git_clean(repo)
+    counter = RequestCounter(args.max_api_requests)
+    planning_model = str((plan.payload.get("advisor") or {}).get("model") or "gpt-6.1-terra")
+    try:
+        model, summary_model = resolve_feature_models(
+            planning_model, feature_model=args.feature_model,
+            summary_model=args.feature_summary_model)
+    except ValueError as exc:
+        raise BackportError(str(exc)) from exc
+    scope = None if args.scope == "all" else ["p0"]
+    total_new, total_skipped = 0, 0
+    combined_events = []
+    # Preserve every feature disposition reviewed across fixed-point passes,
+    # including groups removed from the active TAKE/REVIEW set by new SKIPs.
+    # The per-pass audit already records snapshots; the final human report
+    # should not silently omit completed disagreement assessments.
+    assessed_history = {}
+    latest_open_blockers = (0, 0)
+
+    def blocker_ids(icc_data: dict, kind: str) -> set[str]:
+        # Compare exact structured blocker records, not counts, so a new
+        # serious issue cannot be hidden by one old issue disappearing.
+        return {json.dumps(row, sort_keys=True, separators=(",", ":"))
+                for row in icc_data.get(kind, [])}
+
+    last_proposal = None
+    for iteration in range(1, args.max_rounds + 1):
+        plan = Plan(plan.directory)
+        icc = _fresh_icc(plan.directory, plan.plan_digest, plan.revision())
+        if not icc or (icc.get("replay") or {}).get("status") not in ("clean", "blocked"):
+            print(f"Conditioning pass {iteration}: refreshing full ICC (local Git replay)", flush=True)
+            status = check(plan, repo, replay=True)
+            if status != 0 and not args.allow_unresolved:
+                raise BackportError("cannot condition plan with logical/advisor readiness blockers; "
+                                    "--allow-unresolved permits guarded analysis and SKIPs")
+            plan = Plan(plan.directory)
+            icc = _fresh_icc(plan.directory, plan.plan_digest, plan.revision())
+        if not icc or (icc.get("replay") or {}).get("status") == "error":
+            raise BackportError("conditioning requires a current ICC without replay errors")
+        before_logical = blocker_ids(icc, "logical_blockers")
+        before_advisor = blocker_ids(icc, "advisor_readiness_blockers")
+        latest_open_blockers = (len(before_logical), len(before_advisor))
+        if (before_logical or before_advisor) and not args.allow_unresolved:
+            raise BackportError("cannot condition plan with unresolved ICC or advisor blockers; "
+                                "use --allow-unresolved for guarded analysis")
+        if before_logical or before_advisor:
+            print(f"  Pre-existing unresolved obligations: {len(before_logical)} logical, "
+                  f"{len(before_advisor)} advisor; no blockers will be waived", flush=True)
+        report = refresh_review_reports(plan)
+        groups = build_features(plan, report, priorities=scope)
+        if args.auto_skip_disagreements:
+            disputed = build_disagreement_features(plan, report, priorities=scope)
+            groups.extend(disputed)
+            print(f"  Disputed REVIEW feature groups: {len(disputed)} "
+                  "(separate Sol assessments; prior TAKE caches preserved)", flush=True)
+        cache = read_feature_cache(plan.directory).get("assessments", {})
+        unresolved = []
+        for group in groups:
+            meta = feature_metadata(plan, group, report, icc)
+            entry = cache.get(assessment_cache_key(group["id"], model, summary_model))
+            if not (isinstance(entry, dict) and entry.get("evidence_sha256") == _digest(meta)
+                    and isinstance(entry.get("result"), dict)):
+                unresolved.append(group["id"])
+        print(f"Conditioning pass {iteration}: {len(groups)} feature groups, "
+              f"{len(unresolved)} missing current {model} assessments", flush=True)
+        if args.assess and unresolved:
+            limit = (max(0, args.max_new_features - total_new)
+                     if args.max_new_features else len(unresolved))
+            if limit:
+                try:
+                    stats = assess_feature_groups(
+                        plan, groups, report, icc, repo, model=model,
+                        segment_model=summary_model, limit=limit,
+                        retry_invalid=args.retry_invalid,
+                        continue_on_invalid=True,
+                        request_hook=counter.before_request,
+                        usage_hook=counter.on_usage)
+                except ValueError as exc:
+                    # Every completed API response is cached by the feature assessor.
+                    raise BackportError(str(exc)) from exc
+                total_new += stats["new_assessments"]
+                if stats.get("invalid_assessments"):
+                    print(f"  Held {stats['invalid_assessments']} invalid assessment(s) "
+                          "for engineering review; no automatic decisions from them", flush=True)
+        attach_feature_cache(plan, groups, report, icc,
+                             model=model, summary_model=summary_model)
+        write_feature_reports(plan.directory, groups)
+        proposal = recommend_conditioning(
+            plan, groups, report, icc, model=model, summary_model=summary_model,
+            auto_disagreements=args.auto_skip_disagreements)
+        last_proposal = proposal
+        for disposition in proposal.get("feature_decisions", []):
+            assessed_history[disposition["id"]] = disposition
+        print(f"  Proposed safe SKIPs: {len(proposal['proposed_skips'])}; "
+              f"held for engineering: {len(proposal['exceptions'])}", flush=True)
+        # Every pass has a durable snapshot; recommendations alone never
+        # authorize a change. No API calls occur without --assess.
+        audit_conditioning(plan, proposal, applied=args.apply_auto_skips)
+        applied = 0
+        if args.apply_auto_skips and proposal["proposed_skips"]:
+            prev_worksheet = plan.worksheet.read_bytes()
+            prev_revision = plan.revision()
+            try:
+                for row in proposal["proposed_skips"]:
+                    # Verify the original upstream message, independently of
+                    # potentially incomplete planner metadata or model output.
+                    commit_message = git(repo, "log", "-1", "--format=%B", row["sha"])
+                    if re.search(r"(?im)^\s*(?:Fixes:|Cc:\s*stable@)", commit_message):
+                        raise BackportError(
+                            "automatic SKIP blocked by upstream Fixes:/stable provenance "
+                            + row["sha"][:12])
+                    fresh = Plan(plan.directory)
+                    current = fresh.effective(row["sha"])
+                    if (current != "TAKE" and not
+                            (current == "REVIEW" and row.get("advisor_disagreement_resolution")
+                             and row.get("prior_decision") == "REVIEW")):
+                        raise BackportError("concurrent/stale automatic decision candidate")
+                    rationale = "Auto-conditioned optional change: " + row["reason"]
+                    provenance = f"{row['feature_id']} model={model} evidence={row['evidence_sha256']}"
+                    auto_resolution = bool(row.get("advisor_disagreement_resolution"))
+                    if auto_resolution:
+                        provenance += " resolution=advisor-disagreement"
+                    fresh.set_auto_skip(row["sha"], rationale, provenance,
+                                        resolve_disagreement=auto_resolution)
+                    applied += 1
+                refreshed = Plan(plan.directory)
+                status = check(refreshed, repo, replay=True)
+                if status != 0 and not args.allow_unresolved:
+                    raise BackportError("automatic decisions introduced ICC blockers")
+                refreshed = Plan(plan.directory)
+                after_icc = _fresh_icc(refreshed.directory, refreshed.plan_digest, refreshed.revision())
+                if not after_icc or (after_icc.get("replay") or {}).get("status") == "error":
+                    raise BackportError("automatic decisions produced an invalid ICC or replay error")
+                new_logical = blocker_ids(after_icc, "logical_blockers") - before_logical
+                new_advisor = blocker_ids(after_icc, "advisor_readiness_blockers") - before_advisor
+                if new_logical or new_advisor:
+                    raise BackportError("automatic decisions introduced new logical/advisor blockers")
+                latest_open_blockers = (len(after_icc.get("logical_blockers", [])),
+                                        len(after_icc.get("advisor_readiness_blockers", [])))
+                print(f"  Applied {applied} automatic SKIPs: ICC "
+                      f"{refreshed.revision()[:12]}, TAKE={after_icc['take_total']}", flush=True)
+                total_skipped += applied
+                audit_conditioning_result(
+                    plan.directory, plan.plan_digest,
+                    revision_before=prev_revision,
+                    revision_after=refreshed.revision(),
+                    skipped=[r["sha"] for r in proposal["proposed_skips"]],
+                    success=True)
+            except Exception:
+                atomic_bytes(plan.worksheet, prev_worksheet)
+                # Restore a valid ICC bound to the old worksheet; the history
+                # retains the attempted action and does not claim final success.
+                check(Plan(plan.directory), repo, replay=True)
+                audit_conditioning_result(
+                    plan.directory, plan.plan_digest,
+                    revision_before=prev_revision,
+                    revision_after=Plan(plan.directory).revision(),
+                    skipped=[r["sha"] for r in proposal["proposed_skips"]],
+                    success=False)
+                raise
+            combined_events.extend(proposal["proposed_skips"])
+        write_conditioning_report(plan.directory, proposal, applied=applied, budget=counter)
+        if not args.apply_auto_skips or applied == 0:
+            break
+        if args.max_new_features and total_new >= args.max_new_features:
+            print("Assessment limit reached; stopping after validated SKIPs", flush=True)
+            break
+    else:
+        print(f"Reached --max-rounds={args.max_rounds}; review remaining exceptions", flush=True)
+    # Report the whole command, not merely the final fixed-point pass.
+    if last_proposal is not None:
+        final = dict(last_proposal)
+        final["feature_decisions"] = list(assessed_history.values())
+        final["groups_considered"] = len(assessed_history)
+        final["disagreement_groups_considered"] = sum(
+            gid.startswith("D-") for gid in assessed_history)
+        final["assessed_groups"] = sum(
+            row.get("assessment_status") == "ASSESSED"
+            for row in assessed_history.values())
+        if combined_events:
+            final["proposed_skips"] = combined_events
+        final_plan = Plan(plan.directory)
+        final["decision_revision"] = final_plan.revision()
+        latest_icc = _fresh_icc(final_plan.directory, final_plan.plan_digest,
+                                final_plan.revision())
+        if latest_icc:
+            final["unresolved_obligations"] = {
+                "logical_blockers": latest_icc.get("logical_blockers", []),
+                "advisor_readiness_blockers": latest_icc.get("advisor_readiness_blockers", []),
+            }
+        write_conditioning_report(plan.directory, final,
+                                  applied=total_skipped, budget=counter)
+    print(f"Conditioning finished: {total_new} new feature assessments, "
+          f"{total_skipped} automatic SKIPs, {counter.attempts} API request attempts", flush=True)
+    if latest_open_blockers != (0, 0):
+        print(f"OPEN ENGINEERING EXCEPTIONS: {latest_open_blockers[0]} logical and "
+              f"{latest_open_blockers[1]} advisor blockers; execution remains prohibited "
+              "until these are explicitly resolved", flush=True)
+    tokens = counter.summary()
+    print(f"Reported API tokens: input={tokens['input_tokens_reported']}, "
+          f"output={tokens['output_tokens_reported']} "
+          "(not a dollar-cost estimate)")
+    print(f"Decision report: {plan.directory}/conditioning-decisions.txt")
+    print(f"Decision history: {plan.directory}/.kernel-backport/conditioning-history.json")
+    return 0
+
+
+def status(plan: Plan, repo: Path) -> int:
+    state = load_state(plan)
+    current = git(repo, "rev-parse", "HEAD")
+    branch = git(repo, "symbolic-ref", "--short", "HEAD")
+    counts = collections.Counter(plan.effective(s) for s in plan.order)
+    print(f"Plan: {plan.directory}")
+    print(f"Source SHA256: {plan.plan_digest}")
+    print(f"Decision revision: {plan.revision()[:12]}")
+    print(f"Execution project ID: {state.get('project_id') or 'not set'}")
+    print(f"Decisions: {counts['TAKE']} TAKE, {counts['SKIP']} SKIP, {counts['REVIEW']} REVIEW")
+    print(f"Kernel branch: {branch}; HEAD: {current}")
+    finished = finished_record(state)
+    if finished is not None:
+        print(f"Execution: FINISHED (handoff HEAD: {finished['final_head']})")
+        print(f"Review record: {plan.directory / finished['manifest']}")
+        if current != finished["final_head"] or branch != state.get("branch"):
+            print("Git history changed after handoff; journal is a historical record (expected during MR review)")
+        return 0
+    icc = None
+    try:
+        icc = validated_icc(plan, repo)
+        print(f"ICC: current, blockers: {len(icc['logical_blockers'])}, replay: {icc['replay']['status']}")
+    except BackportError as exc:
+        print(f"ICC: needs check ({exc})")
+    if state["phases"]:
+        if state.get("repo") != str(repo) or state.get("branch") != branch:
+            print("WARNING: execution state belongs to another repository/branch")
+            return 2
+        for p in state["phases"]:
+            j = phase_journal(p)
+            cursor = j.get("cursor", 0) if j else 0
+            blocked = j.get("blocked") if j else None
+            print(f"Phase {p['id']}: {cursor}/{len(p['order'])}, "
+                  f"{'superseded' if p['superseded'] else 'blocked' if blocked else 'complete' if phase_done(p) else 'active'}")
+        try:
+            current_verified_head(state, repo)
+        except BackportError as exc:
+            print(f"WARNING: {exc}")
+            return 2
+    else:
+        print("Execution: not started")
+    return 0
+
+
+def parse(argv: list[str]):
+    p = argparse.ArgumentParser(prog="kernel-backport", description="Plan, iteratively check, and execute kernel backports")
+    p.add_argument("--version", action="version", version=f"kernel-backport {VERSION}")
+    sub = p.add_subparsers(dest="command", required=True)
+    for name, helptext in (("check", "run the Internal Consistency Check (ICC) without an advisor call"),
+                           ("add", "add a missing upstream SHA to the engineer's plan without rerunning AI"),
+                           ("decide", "set an engineer TAKE/SKIP/REVIEW decision in the worksheet"),
+                           ("apply", "execute an ICC-checked plan using journaled cherry-picks"),
+                           ("resume", "continue an interrupted execution phase"),
+                           ("finish", "verify completion and hand the patch series over to Git"),
+                           ("status", "show plan and execution progress"),
+                           ("review", "show P0-P3 review priorities without changing worksheet decisions"),
+                           ("condition", "review features and optionally apply auditable conservative automatic SKIPs")):
+        q = sub.add_parser(name, help=helptext)
+        q.add_argument("--results-dir", help="planner run directory (default latest in $KERNEL_WORKSPACE_DIR)")
+        q.add_argument("--repo", help="kernel Git working repository")
+        if name == "review":
+            selection = q.add_mutually_exclusive_group()
+            selection.add_argument("--priority", choices=("critical", "high", "normal",
+                                                          "deferred", "p0", "p1", "p2", "p3"),
+                                   help="show a single priority; default P0 and P1")
+            selection.add_argument("--all", action="store_true",
+                                   help="show all four priority levels")
+            q.add_argument("--format", choices=("text", "json"), default="text")
+            q.add_argument("--assess", action="store_true",
+                           help="opt-in billable, patch-grounded Terra review of selected TAKE findings")
+            q.add_argument("--assess-model", default="",
+                           help="review model override: per-commit advisor or legacy feature alias")
+            q.add_argument("--feature-model", default="",
+                           help="final feature-selection model (default: gpt-6.1-sol)")
+            q.add_argument("--feature-summary-model", default="",
+                           help="upstream patch segment-summary model (default: recorded planning advisor)")
+            q.add_argument("--assess-limit", type=int, default=0,
+                           help="maximum new assessments this call (0: all selected findings)")
+            q.add_argument("--features", action="store_true",
+                           help="view related selected commits as feature groups (no API calls)")
+            q.add_argument("--assess-features", action="store_true",
+                           help="billable opt-in feature-chain analysis and minimum commit recommendations")
+            q.add_argument("--feature-limit", type=int, default=0,
+                           help="max new billable feature assessments this call (0: all groups)")
+            q.add_argument("--retry-invalid", action="store_true",
+                           help="retry invalid saved feature response with a NEW billable API call")
+        if name == "condition":
+            q.add_argument("--assess", action="store_true",
+                           help="explicitly authorize billable Sol/Terra feature assessments")
+            q.add_argument("--apply-auto-skips", action="store_true",
+                           help="opt in to guarded automatic SKIPs; otherwise dry-run")
+            q.add_argument("--allow-unresolved", action="store_true",
+                           help="assess and safely condition while recording pre-existing ICC/advisor blockers; never authorize execution")
+            q.add_argument("--auto-skip-disagreements", action="store_true",
+                           help="include disputed REVIEW commits in separate Sol feature assessments; automatically SKIP only high-confidence optional LOW-value disagreements; requires --allow-unresolved")
+            q.add_argument("--scope", choices=("critical", "all"), default="critical",
+                           help="critical P0 groups (default) or all selected feature groups")
+            q.add_argument("--feature-model", default="",
+                           help="final reviewer (default gpt-6.1-sol)")
+            q.add_argument("--feature-summary-model", default="",
+                           help="patch summary reviewer (default planner model, usually Terra)")
+            q.add_argument("--max-new-features", type=int, default=0,
+                           help="hard cap on new group assessments (0: no cap)")
+            q.add_argument("--max-api-requests", type=int, default=0,
+                           help="hard cap on Sol + Terra API request attempts (0: no cap)")
+            q.add_argument("--max-rounds", type=int, default=4,
+                           help="maximum conditioning/replay fixed-point passes")
+            q.add_argument("--retry-invalid", action="store_true",
+                           help="retry invalid cached model response with a new billable call")
+            q.add_argument("--report-only", action="store_true",
+                           help="read the most recent decision report; no API or ICC")
+        if name == "check":
+            q.add_argument("--no-replay", action="store_true", help="logical checks only; skip temporary cherry-pick test")
+        if name == "add":
+            q.add_argument("commit", help="upstream Git SHA available in the local repository")
+            q.add_argument("--decision", choices=DECISIONS, default="TAKE",
+                           help="engineer selection; defaults to TAKE")
+            q.add_argument("--reason", required=True, help="why the commit belongs in the backport")
+            q.add_argument("--required-by", action="append", default=[], metavar="SHA",
+                           help="existing TAKE consumer that requires this commit (repeatable)")
+            q.add_argument("--requires", action="append", default=[], metavar="SHA",
+                           help="existing prerequisite required by the new commit (repeatable)")
+            q.add_argument("--fixes", action="append", default=[], metavar="SHA",
+                           help="verify upstream Fixes: trailer for a planned commit (repeatable; not a hard dependency)")
+            q.add_argument("--allow-outside-target", action="store_true",
+                           help="explicitly authorize adding a commit outside the frozen upstream target")
+        if name == "decide":
+            q.add_argument("commit", help="unique upstream SHA or abbreviation")
+            q.add_argument("decision", choices=DECISIONS)
+            q.add_argument("--reason", help="engineer rationale, one line")
+        if name in ("apply", "resume"):
+            q.add_argument("--project-id", default=os.environ.get("PROJECT_ID"),
+                           help="project identifier (default: $PROJECT_ID), e.g. rhel-223619")
+            q.add_argument("--max-attempts", type=int, default=1)
+            q.add_argument("--reference-root", help="backporter Git reference cache")
+            q.add_argument("--upstream-url", help="upstream reference Git URL/path")
+            q.add_argument("--downstream-url", help="downstream reference Git URL/path")
+            q.add_argument("--skip-refresh", action="store_true", help="use local backporter reference cache")
+    return p.parse_args(argv)
+
+
+@contextlib.contextmanager
+def locked_run(plan: Plan):
+    """Prevent concurrent checks, edits and execution on the same plan cycle."""
+    lockfile = plan.directory / ".kernel-backport" / "lock"
+    lockfile.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with lockfile.open("a+") as handle:
+        os.chmod(lockfile, 0o600)
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise BackportError("another kernel-backport operation is already using this plan") from exc
+        try:
+            yield
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] == "plan":
+        return subprocess.run([sys.executable, str(PLANNER), *argv[1:]]).returncode
+    if argv and argv[0] == "legacy-backport":
+        return subprocess.run([sys.executable, str(EXECUTOR), *argv[1:]]).returncode
+    args = parse(argv)
+    if args.command in ("apply", "resume"):
+        if args.max_attempts < 1:
+            raise BackportError("--max-attempts must be at least 1")
+        if not args.project_id:
+            raise BackportError("--project-id is required (or export PROJECT_ID)")
+        if not PROJECT_ID_PATTERN.fullmatch(args.project_id):
+            raise BackportError("invalid project ID: use letters, digits, periods, underscores and hyphens (max 128 chars)")
+    plan = Plan(path_arg(args.results_dir))
+    if args.command == "review":
+        if args.assess_limit < 0:
+            raise BackportError("--assess-limit must be >= 0")
+        if args.feature_limit < 0:
+            raise BackportError("--feature-limit must be >= 0")
+        if args.assess and (args.features or args.assess_features):
+            raise BackportError("choose either per-commit --assess or feature-level --assess-features")
+        if args.assess_limit and not args.assess:
+            raise BackportError("--assess-limit requires --assess")
+        if args.feature_limit and not args.assess_features:
+            raise BackportError("--feature-limit requires --assess-features")
+        if args.retry_invalid and not args.assess_features:
+            raise BackportError("--retry-invalid requires --assess-features")
+        if args.feature_model and not (args.assess_features or args.features):
+            raise BackportError("--feature-model requires --features or --assess-features")
+        if args.feature_summary_model and not args.assess_features:
+            raise BackportError("--feature-summary-model requires --assess-features")
+        if args.feature_model and args.assess_model:
+            raise BackportError("use either --feature-model or legacy --assess-model, not both")
+        if args.assess_model and not (args.assess or args.assess_features):
+            raise BackportError("--assess-model requires --assess or --assess-features")
+        if (args.assess or args.assess_features) and args.all:
+            raise BackportError("use --priority for a billable review; --all would assess every queued item")
+        if (args.assess or args.assess_features) and args.format == "json":
+            raise BackportError("run billable assessment in text mode, then use --format json without --assess or --assess-features")
+        with locked_run(plan):
+            plan = Plan(plan.directory)
+            if finished_record(load_state(plan)) and (args.assess or args.assess_features):
+                raise BackportError("plan is finished; billable review/evidence updates are closed")
+            return review(plan, priority=({"critical": "p0", "high": "p1",
+                                          "normal": "p2", "deferred": "p3"}.get(
+                                          args.priority, args.priority)),
+                          show_all=args.all, fmt=args.format,
+                          assess=args.assess, assess_model=args.assess_model,
+                          assess_limit=args.assess_limit,
+                          repo=repo_arg(args.repo) if (args.assess or args.assess_features) else None,
+                          features=args.features, assess_features=args.assess_features,
+                          feature_limit=args.feature_limit,
+                          retry_invalid=args.retry_invalid,
+                          feature_model=args.feature_model,
+                          feature_summary_model=args.feature_summary_model)
+    repo = repo_arg(args.repo)
+    if args.command == "condition" and args.report_only:
+        path = plan.directory / "conditioning-decisions.txt"
+        if path.is_symlink() or not path.is_file():
+            raise BackportError("no conditioning report exists for this plan")
+        print(path.read_text(encoding="utf-8"))
+        return 0
+    if args.command == "status":
+        return status(plan, repo)  # no filesystem mutation
+    with locked_run(plan):
+        # Re-read state and decisions only after acquiring the cycle lock.
+        plan = Plan(plan.directory)
+        if args.command == "finish":
+            return finish(plan, repo)
+        require_open_execution(load_state(plan))
+        if args.command == "add":
+            git_clean(repo)
+            plan.add_commit(repo, args.commit, args.decision, args.reason,
+                            args.required_by, args.requires,
+                            args.fixes, args.allow_outside_target)
+            refresh_review_reports_best_effort(plan.directory)
+            return 0
+        if args.command == "decide":
+            commit = resolve_planned_sha(args.commit, plan.order)
+            previous = plan.effective(commit)
+            old_revision = plan.revision()
+            plan.set_decision(args.commit, args.decision, args.reason)
+            new_plan = Plan(plan.directory)
+            audit_manual_decision(
+                plan.directory, plan.plan_digest, commit=commit,
+                before=previous, after=args.decision, reason=args.reason or "",
+                revision_before=old_revision, revision_after=new_plan.revision())
+            refresh_review_reports_best_effort(plan.directory)
+            return 0
+        if args.command == "condition":
+            return condition(plan, repo, args)
+        if args.command == "check":
+            rc = check(plan, repo, replay=not args.no_replay)
+            refresh_review_reports_best_effort(plan.directory)
+            return rc
+        if args.command == "status":
+            return status(plan, repo)
+        return execute(plan, repo, args, resume=(args.command == "resume"))
+
+
+if __name__ == "__main__":
+    # --format json is a data protocol, not human prose. Never wrap it.
+    json_requested = ("--format=json" in sys.argv or
+                      any(sys.argv[i] == "--format" and
+                          i + 1 < len(sys.argv) and sys.argv[i + 1] == "json"
+                          for i in range(1, len(sys.argv))))
+    if not json_requested:
+        sys.stdout = ColumnWriter(sys.stdout)
+        sys.stderr = ColumnWriter(sys.stderr)
+    try:
+        raise SystemExit(main())
+    except BackportError as exc:
+        print(f"kernel-backport: {exc}", file=sys.stderr)
+        raise SystemExit(1)
+    except KeyboardInterrupt:
+        print("kernel-backport: interrupted", file=sys.stderr)
+        raise SystemExit(130)

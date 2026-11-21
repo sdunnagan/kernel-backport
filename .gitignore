@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# Credentials
+.env
+.env.*
+*.env
+
+# Editor files
+*.swp
+*~
+.vscode/
+.idea/
+
+# Generated backport state (not source code)
+.kernel-backport/
+backport_plan_*/
+backport-plans/
+
+# Temporary files
+*.log
+*.tmp

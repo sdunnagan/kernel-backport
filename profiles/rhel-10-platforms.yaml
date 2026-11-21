@@ -1,0 +1,894 @@
+# kernel-backport platform profile (schema v2)
+# Research provenance in this file is a dated engineering snapshot, NOT a
+# RHEL certification database. Keep source URLs and evidence caveats below.
+#
+# ACTIVE PRODUCT SCOPES FOR THIS BACKPORT PROJECT:
+#   rhel10         - RHEL 10 family, including explicitly stated RHEL 9 proxies
+#   user_selected  - engineer-selected targets, not necessarily certified
+#   rhivos         - Red Hat In-Vehicle OS (distinct product)
+#   rhel_for_nvidia - RHEL for NVIDIA edition (distinct product variant)
+#
+# support_basis indicates *why* the system is considered relevant, not proof
+# that any source-path match is an exact certified system match.
+# match_scope identifies whether a patch matches an exact board, an upstream
+# reference-board proxy, shared SoC source, a shared driver, a guest interface,
+# or architecture-level code. Broad path patterns are only relevance hints.
+#
+# IMPORTANT: unmatched_board REVIEW preserves engineer review for unknown
+# boards, while supported shared architecture/subsystem changes remain eligible
+# for upstream convergence. Negative board patterns must not reject shared code.
+# A Makefile-only change does not establish an excluded board.
+#
+# Original RHEL scope research assembled for the consolidated tool
+# Research snapshot: 2026-11-10. USER-EDITABLE, NON-EXHAUSTIVE.
+# Updated 2026-11-05: added publicly documented RHIVOS platform scope.
+# Updated 2026-11-07: added Arm AGI CPU using public software evidence.
+# Updated 2026-11-10: clarified unmatched-board review policy for 0.4.36.
+# Updated 2026-11-10: expanded ARM64 scope from published RHEL 9 system
+# certification and documented supported cloud instances.
+# Updated 2026-11-10: expanded x86_64 server, workstation, laptop, cloud
+# guest, and confidential-guest scope using public RHEL 9/10 evidence.
+# Updated 2026-11-10: seeded narrow, board-specific engineering exclusions
+# from backport_plan_06; unknown boards still REVIEW.
+#
+# This is an engineering SCOPE FILE, not an official Red Hat support matrix.
+# Listed public certification examples are evidence of relevant system families;
+# the paths below are kernel-source matching hints, NOT proof that any changed
+# code affects every named machine. Certified model != certified CPU family.
+# RHIVOS entries describe a separate automotive product scope, NOT standard
+# RHEL 10 hardware certification or an AutoSD development-board allowlist.
+#
+# ENGINEERING ASSUMPTION FOR THIS BACKPORT PROJECT:
+# Treat published RHEL 9 aarch64-certified system families as likely relevant
+# to our RHEL 10 rebase investigation. This does NOT carry forward their
+# formal certification: RHEL 9 and RHEL 10 certifications are distinct.
+# Some entries describe publicly supported ARM64 cloud GUEST environments,
+# which are NOT certifications of physical boards. Their paths identify
+# shared guest interfaces, not CPU- or system-specific hardware IDs.
+# Each DTS/DT-compatible proxy below may match upstream reference hardware
+# rather than an exact OEM board or carrier. Do not mistake it for proof of
+# that OEM board's kernel support.
+# x86 systems usually lack board-specific in-kernel identification. The x86
+# paths below are CPU-family, vendor-driver, or guest-feature relevance hints;
+# they do NOT prove support for each system model and do not identify models
+# uniquely. Published RHEL 9 certifications are only engineering proxies for
+# RHEL 10 when no specific RHEL 10 certification is cited.
+# TDX/SEV-SNP GUEST support is distinct from host support: the cited RHEL 10
+# documentation lists confidential-computing host enablement as Technology
+# Preview. These entries must not be interpreted as host feature certification.
+#
+# RHEL 10 public hardware certification is per system/architecture/version:
+# https://docs.redhat.com/en/documentation/red_hat_hardware_certification/2026/html-single/red_hat_hardware_certification_program_policy_guide/index
+# https://catalog.redhat.com/en/search?searchType=hardware
+# https://docs.redhat.com/en/documentation/red_hat_hardware_certification/2026/html-single/red_hat_hardware_certification_program_policy_guide/index
+#
+# Schema v2 requires product_scope, support_basis, match_scope in every entry.
+# Certification status remains only as documented in research URLs/comments.
+#
+# unmatched_board: REVIEW is an engineering scope policy. Unmatched board-only
+# changes require review, rather than being taken solely for clean replay or
+# apparent upstream benefit. Verified TAKE-consumer prerequisites are assessed
+# separately. Shared SoC infrastructure may still receive TAKE recommendations;
+# engineer judgment is needed for new SoC enablement outside selected scope.
+#
+# EXPLICIT ENGINEERING EXCLUSIONS (not vendor-wide / official Red Hat bans):
+# Initial seed from the 0.4.36 backport_plan_06 REVIEW candidates, plus
+# Raspberry Pi 4/5 and earlier Rock 5/Orange Pi boards requested for scope.
+# These are likely irrelevant RHEL 9/10 board families, NOT a researched
+# negative certification ruling. Internal product requirements override.
+# A skipped board can still be reconsidered if a verified TAKE dependency
+# needs it. Shared driver / SoC fixes remain independently evaluable.
+# Unrecognized hardware remains unmatched_board: REVIEW.
+version: 2
+active_product_scopes:
+  - rhel10
+  - user_selected
+  - rhivos
+  - rhel_for_nvidia
+name: rhel-10-plus-rhivos-nvidia-user-selected
+unmatched_board: REVIEW
+
+platforms:
+  # -------------------------------------------------------------------------
+  # ARM64: Arm AGI CPU (user-selected product-scope target).
+  # Announced publicly by Arm in March 2026. Arm and Red Hat publicly
+  # described a joint enterprise software initiative in May 2026. This is
+  # evidence of product relevance, not proof of RHEL 10 certification for
+  # an individual AGI-based server model.
+  # Arm AGI CPU uses Neoverse V3 cores and standards-based server firmware.
+  # It is an ACPI/SBSA server, not a DT board; no unique public AGI ACPI HID
+  # or kernel device ID has been verified, so none is invented here.
+  # The two source paths below are shared MPAM infrastructure, not unique
+  # AGI identifiers. Their selection is intentionally narrow: AGI CPU was
+  # named as test hardware for upstream MPAM firmware-backed access patches.
+  # Basic MPAM sources exist in Linux v7.0, but MPAM-Fb changes submitted in
+  # Sep 2026 are not assumed to be merged into the v7.0 target.
+  # Sources:
+  # https://newsroom.arm.com/news/arm-agi-cpu-launch
+  # https://newsroom.arm.com/blog/agentic-ai-infrastructure-arm-agi-cpu-red-hat
+  # https://github.com/torvalds/linux/blob/v7.0/drivers/acpi/arm64/mpam.c
+  # https://github.com/torvalds/linux/blob/v7.0/drivers/resctrl/mpam_devices.c
+  # https://lists.openwall.net/linux-kernel/2026/09/11/1272
+  - name: Arm AGI CPU (Neoverse V3, user-selected)
+    product_scope: user_selected
+    support_basis: user_selected
+    match_scope: shared_driver
+    architecture: arm64
+    paths:
+      - 'drivers/acpi/arm64/mpam.c'
+      - 'drivers/resctrl/mpam_devices.c'
+
+  # -------------------------------------------------------------------------
+  # ARM64: NVIDIA Vera Rubin (NVIDIA Vera/Olympus Arm CPU + Rubin GPU)
+  # Red Hat publicly targets Vera Rubin through its RHEL for NVIDIA edition,
+  # notably 26.03, based on RHEL 10.2.z. NOT equivalent to a certified
+  # individual server model running an unmodified standard RHEL 10 kernel.
+  # Sources:
+  # https://docs.redhat.com/en/documentation/red_hat_enterprise_linux_for_nvidia/26.03/whats_new-26_03_overview
+  # https://docs.nvidia.com/dccpu/patches-config-guide/platform-software-patches-config_vera.html
+  # https://www.redhat.com/en/blog/rhel-nvidia-delivers-trusted-foundation-next-gen-ai-workloads
+  # This is an ACPI/SBSA class of system, not a DT board. The kernel paths
+  # are selected subsystem anchors, not unique Vera identifiers.
+  - name: NVIDIA Vera Rubin (RHEL for NVIDIA 26.03 scope)
+    product_scope: rhel_for_nvidia
+    support_basis: product_documented
+    match_scope: shared_driver
+    architecture: arm64
+    paths:
+      - 'arch/arm64/kernel/cpu_errata.c'
+      - 'drivers/perf/arm_cspmu/nvidia_cspmu.c'
+      - 'drivers/vfio/pci/nvgrace-gpu/*'
+
+  # ARM64: NVIDIA Grace Hopper/Grace Blackwell certified machine examples.
+  # HPE ProLiant Compute DL384 Gen12 and Supermicro ARS-111GL-NHR have RHEL 10
+  # aarch64 certification. GIGABYTE XV23-VC0 (Grace CPU Superchip) has RHEL
+  # 9.3 aarch64 certification. Shared NVIDIA paths are NOT model-specific.
+  # Grace-based servers use UEFI/ACPI rather than board DTS identifiers.
+  # https://catalog.redhat.com/en/hardware/system/detail/258687
+  # https://catalog.redhat.com/en/hardware/system/detail/246547
+  # https://catalog.redhat.com/en/hardware/system/detail/282047
+  # https://access.redhat.com/solutions/7053917
+  - name: NVIDIA Grace server class (HPE DL384, Supermicro ARS-111GL, GIGABYTE XV23-VC0)
+    product_scope: rhel10
+    support_basis: certified_rhel10
+    match_scope: shared_driver
+    architecture: arm64
+    paths:
+      - 'drivers/perf/arm_cspmu/nvidia_cspmu.c'
+      - 'drivers/vfio/pci/nvgrace-gpu/*'
+
+  # ARM64: Jetson Orin Nano (explicit USER-SCOPED inclusion).
+  # Public evidence supports RHEL-based Jetson Orin enablement; Red Hat
+  # documents RHEL 9.8 GA on certified Orin/carrier combinations and a
+  # RHEL 10.0 Jetson Orin installation issue. That does NOT establish an
+  # unconditional RHEL 10 certification for every Orin Nano developer kit.
+  # Verify the particular module/carrier combination separately.
+  # https://access.redhat.com/solutions/7145045
+  # https://access.redhat.com/solutions/7120924
+  # https://next.redhat.com/project/nvidia-jetson-orin-device-enablement/
+  # Upstream P3768 + P3767 SKU 5 DTS and compatible identifiers:
+  # https://android.googlesource.com/kernel/common/+/refs/heads/android-mainline/arch/arm64/boot/dts/nvidia/tegra234-p3768-0000%2Bp3767-0005.dts
+  - name: NVIDIA Jetson Orin Nano Developer Kit (user-selected)
+    product_scope: user_selected
+    support_basis: user_selected
+    match_scope: exact_board
+    architecture: arm64
+    paths:
+      - 'arch/arm64/boot/dts/nvidia/tegra234-p3768-0000+p3767-0005.dts'
+      - 'arch/arm64/boot/dts/nvidia/tegra234-p3767.dtsi'
+    identifiers:
+      dt_compatible:
+        - 'nvidia,p3768-0000+p3767-0005'
+        - 'nvidia,p3767-0005'
+
+  # ARM64: Connect Tech Hadron NGX012, NVIDIA Jetson Orin NX 16GB.
+  # Red Hat hardware catalog: RHEL 9.8 aarch64-certified carrier/system.
+  # The upstream P3767/P3768 files and DT identifiers describe NVIDIA's
+  # module/reference design; the Connect Tech carrier may use downstream
+  # device trees not present in upstream Linux v7.0.
+  # https://catalog.redhat.com/en/hardware/system/detail/230867
+  # https://github.com/torvalds/linux/blob/v7.0/arch/arm64/boot/dts/nvidia/tegra234-p3768-0000%2Bp3767-0000.dts
+  - name: NVIDIA Jetson Orin NX (Connect Tech Hadron NGX012, RHEL 9.8)
+    product_scope: rhel10
+    support_basis: certified_rhel9_proxy
+    match_scope: reference_board_proxy
+    architecture: arm64
+    paths:
+      - 'arch/arm64/boot/dts/nvidia/tegra234-p3768-0000+p3767-0000.dts'
+      - 'arch/arm64/boot/dts/nvidia/tegra234-p3767.dtsi'
+    identifiers:
+      dt_compatible:
+        - 'nvidia,p3768-0000+p3767-0000'
+        - 'nvidia,p3767-0000'
+
+  # ARM64: Connect Tech Rogue AGX202, NVIDIA Jetson AGX Orin.
+  # Red Hat hardware catalog: RHEL 9.8 aarch64-certified carrier/system.
+  # Upstream P3701/P3737 describes the NVIDIA development/reference board,
+  # NOT a verified DTS for the Connect Tech Rogue carrier.
+  # https://catalog.redhat.com/en/hardware/system/detail/324327
+  # https://github.com/torvalds/linux/blob/v7.0/arch/arm64/boot/dts/nvidia/tegra234-p3737-0000%2Bp3701-0000.dts
+  - name: NVIDIA Jetson AGX Orin (Connect Tech Rogue AGX202, RHEL 9.8)
+    product_scope: rhel10
+    support_basis: certified_rhel9_proxy
+    match_scope: reference_board_proxy
+    architecture: arm64
+    paths:
+      - 'arch/arm64/boot/dts/nvidia/tegra234-p3737-0000+p3701-0000.dts'
+      - 'arch/arm64/boot/dts/nvidia/tegra234-p3701-0000.dtsi'
+    identifiers:
+      dt_compatible:
+        - 'nvidia,p3737-0000+p3701-0000'
+        - 'nvidia,p3701-0000'
+
+  # ARM64: Advantech ECU-150 industrial IoT gateway, NXP i.MX8M Quad.
+  # Red Hat hardware catalog: RHEL 9.3 aarch64-certified EDGE SYSTEM.
+  # The exact Advantech board DTS/compatible is not verified in upstream
+  # Linux v7.0, so match only the i.MX8MQ SoC's shared DTSI/compatible.
+  # This is an intentionally coarse SoC-class proxy, NOT certification of
+  # unrelated i.MX8MQ evaluation boards or all NXP i.MX8-family products.
+  # https://catalog.redhat.com/en/hardware/system/detail/230097
+  # https://github.com/torvalds/linux/blob/v7.0/arch/arm64/boot/dts/freescale/imx8mq.dtsi
+  - name: NXP i.MX8M Quad (Advantech ECU-150, RHEL 9.3)
+    product_scope: rhel10
+    support_basis: certified_rhel9_proxy
+    match_scope: soc_shared
+    architecture: arm64
+    paths:
+      - 'arch/arm64/boot/dts/freescale/imx8mq.dtsi'
+    identifiers:
+      dt_compatible:
+        - 'fsl,imx8mq'
+
+  # ARM64: Ampere Altra / AmpereOne UEFI-ACPI / SBSA server class.
+  # Published RHEL 9 aarch64-certified examples include:
+  # HPE ProLiant RL300 Gen11 (RHEL 9.2), GIGABYTE MP72-HB0 (RHEL 9.0),
+  # Ampere Altra Max Mt. Jade 2S (RHEL 9.0), and Supermicro ARS-110M-NR
+  # (manufacturer's RHEL 9.0 OS certification matrix). HPE RL300 also has
+  # RHEL 10 certification. The CPU family covers multiple physical servers.
+  # Processor/family certification does not certify every chassis or SKU.
+  # ACPI and Arm CMN code are broad infrastructure PROXIES, not unique IDs.
+  # https://catalog.redhat.com/en/hardware/system/detail/149387
+  # https://catalog.redhat.com/en/hardware/system/detail/220797
+  # https://catalog.redhat.com/en/hardware/system/detail/142217
+  # https://www.supermicro.com/en/support/os-compatibility-certification
+  # https://catalog.redhat.com/en/hardware/detail/247677
+  # https://catalog.redhat.com/en/hardware/detail/247687
+  # https://catalog.redhat.com/en/hardware/components/detail/270197
+  - name: Ampere Altra and AmpereOne UEFI-ACPI server class (HPE RL300, GIGABYTE MP72, Ampere Mt Jade)
+    product_scope: rhel10
+    support_basis: certified_rhel10
+    match_scope: shared_driver
+    architecture: arm64
+    paths:
+      - 'drivers/acpi/arm64/*'
+      - 'drivers/perf/arm-cmn.c'
+
+  # -------------------------------------------------------------------------
+  # ARM64: Public cloud GUEST scope (not bare-metal board certification).
+  # Both families are RHEL 9-compatible in vendor publications. Unlike DTS
+  # boards, guests usually have no distinctive DT compatible or ACPI HID.
+  # Paths below are narrow paravirtual/virtual-device *proxies* and can also
+  # apply to other CPU architectures or guest environments.
+  #
+  # AWS EC2 Graviton: RHEL 9 on ARM64 instances; AWS documents EFA with RHEL
+  # 9 on Graviton. ENA and EFA are common AWS guest interfaces, not Graviton
+  # CPU identifiers. This entry does not claim a certified EC2 bare-metal board.
+  # https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/efa.html
+  # https://catalog.redhat.com/en/cloud/detail/142897
+  - name: AWS EC2 Graviton ARM64 guests (RHEL 9 cloud scope)
+    product_scope: rhel10
+    support_basis: supported_guest_rhel9_proxy
+    match_scope: guest_interface
+    architecture: arm64
+    paths:
+      - 'drivers/net/ethernet/amazon/ena/*'
+      - 'drivers/infiniband/hw/efa/*'
+
+  # Microsoft Azure Cobalt 100 ARM64 VMs: RHEL 9 supported as guest OS.
+  # Specific guest VMBus and netvsc files avoid host-side mshv paths.
+  # Do not confuse this with RHEL certification of a physical Cobalt server.
+  # https://learn.microsoft.com/en-us/azure/virtual-machines/sizes/cobalt-overview
+  - name: Microsoft Azure Cobalt 100 ARM64 guests (RHEL 9 cloud scope)
+    product_scope: rhel10
+    support_basis: supported_guest_rhel9_proxy
+    match_scope: guest_interface
+    architecture: arm64
+    paths:
+      - 'drivers/hv/vmbus_drv.c'
+      - 'drivers/hv/connection.c'
+      - 'drivers/hv/channel.c'
+      - 'drivers/hv/channel_mgmt.c'
+      - 'drivers/hv/ring_buffer.c'
+      - 'drivers/hv/hv_balloon.c'
+      - 'drivers/hv/hv_util.c'
+      - 'drivers/hv/hv_kvp.c'
+      - 'drivers/hv/hv_snapshot.c'
+      - 'drivers/net/hyperv/*'
+
+  # -------------------------------------------------------------------------
+  # ARM64: RHIVOS (Red Hat In-Vehicle OS) supported automotive SoCs.
+  # RHIVOS is a separate product from standard RHEL 10. Its public datasheet
+  # identifies Renesas R-Car S4 and Qualcomm SA8775 as supported platforms,
+  # with R-Car S4 specifically listed in the RHIVOS safety scope. These entries
+  # identify upstream SoC/board code relevant to those platforms; the
+  # upstream evaluation-board DTS files do not establish certification of
+  # individual boards or specific carrier configurations.
+  # https://www.redhat.com/en/resources/in-vehicle-operating-system-datasheet
+  #
+  # Renesas R-Car S4: R8A779F0 (S4-8) and R8A779F4 (S4 Starter Kit).
+  # Upstream Linux v7.0 identifiers include renesas,r8a779f0, r8a779f4,
+  # renesas,s4sk, and Spider reference boards. The SoC .dtsi files are
+  # intentionally included as shared dependencies, not board certification.
+  # https://github.com/torvalds/linux/blob/v7.0/arch/arm64/boot/dts/renesas/r8a779f0.dtsi
+  # https://github.com/torvalds/linux/blob/v7.0/arch/arm64/boot/dts/renesas/r8a779f4-s4sk.dts
+  # https://github.com/torvalds/linux/blob/v7.0/arch/arm64/boot/dts/renesas/r8a779f0-spider.dts
+  - name: Renesas R-Car S4 (RHIVOS automotive scope)
+    product_scope: rhivos
+    support_basis: product_documented
+    match_scope: soc_shared
+    architecture: arm64
+    paths:
+      - 'arch/arm64/boot/dts/renesas/r8a779f0.dtsi'
+      - 'arch/arm64/boot/dts/renesas/r8a779f0-spider.dts'
+      - 'arch/arm64/boot/dts/renesas/r8a779f0-spider-cpu.dtsi'
+      - 'arch/arm64/boot/dts/renesas/r8a779f0-spider-ethernet.dtsi'
+      - 'arch/arm64/boot/dts/renesas/r8a779f4.dtsi'
+      - 'arch/arm64/boot/dts/renesas/r8a779f4-s4sk.dts'
+    identifiers:
+      dt_compatible:
+        - 'renesas,r8a779f0'
+        - 'renesas,r8a779f4'
+        - 'renesas,s4sk'
+        - 'renesas,spider-breakout'
+        - 'renesas,spider-cpu'
+
+  # Qualcomm SA8775P / Snapdragon Ride: upstream v7.0 SA8775P Ride and R3
+  # boards reference lemans-auto.dtsi, lemans.dtsi, and shared Ride files.
+  # The common Lemans source has IoT users too, so matching it establishes
+  # potential shared-code relevance, NOT support for all Lemans/QCS9100 boards.
+  # Later upstream kernels removed the legacy SA8775P Ride board DTS files;
+  # these paths intentionally target this project's v6.19 -> v7.0 analysis.
+  # https://github.com/torvalds/linux/blob/v7.0/arch/arm64/boot/dts/qcom/sa8775p-ride.dts
+  # https://github.com/torvalds/linux/blob/v7.0/arch/arm64/boot/dts/qcom/sa8775p-ride-r3.dts
+  # https://github.com/torvalds/linux/blob/v7.0/arch/arm64/boot/dts/qcom/lemans-auto.dtsi
+  # https://github.com/torvalds/linux/blob/v7.0/arch/arm64/boot/dts/qcom/lemans.dtsi
+  # https://kernel.googlesource.com/pub/scm/linux/kernel/git/netdev/net/+/921f145639e4626ae232b1ef0e935081e6d44043
+  - name: Qualcomm SA8775P Snapdragon Ride (RHIVOS automotive scope)
+    product_scope: rhivos
+    support_basis: product_documented
+    match_scope: soc_shared
+    architecture: arm64
+    paths:
+      - 'arch/arm64/boot/dts/qcom/sa8775p-ride.dts'
+      - 'arch/arm64/boot/dts/qcom/sa8775p-ride-r3.dts'
+      - 'arch/arm64/boot/dts/qcom/lemans-auto.dtsi'
+      - 'arch/arm64/boot/dts/qcom/lemans.dtsi'
+      - 'arch/arm64/boot/dts/qcom/lemans-pmics.dtsi'
+      - 'arch/arm64/boot/dts/qcom/lemans-ride-common.dtsi'
+    identifiers:
+      dt_compatible:
+        - 'qcom,sa8775p-ride'
+        - 'qcom,sa8775p-ride-r3'
+        - 'qcom,sa8775p'
+
+  # -------------------------------------------------------------------------
+  # x86_64: Intel Xeon servers and workstations (published RHEL 9/10 systems).
+  # RHEL 10-certified server examples: Dell PowerEdge R770AP/R760/R960,
+  # Lenovo ThinkSystem SR650/SR850 V4, Fujitsu PRIMERGY RX2540 M8, and
+  # Cisco UCS X210c M7. Workstations include Lenovo ThinkStation P7 and
+  # HP Z8 Fury G5, which have RHEL 9 and RHEL 10 certifications.
+  # Xeon CPU/performance paths are shared family proxies, NOT DMI matches for
+  # any of these systems. Individual chassis certification is separate.
+  # https://catalog.redhat.com/en/hardware/system/detail/299657
+  # https://catalog.redhat.com/en/hardware/system/detail/144067
+  # https://catalog.redhat.com/en/hardware/system/detail/144627
+  # https://catalog.redhat.com/en/hardware/system/detail/278647
+  # https://catalog.redhat.com/en/hardware/system/detail/291057
+  # https://catalog.redhat.com/en/hardware/system/detail/286867
+  # https://catalog.redhat.com/en/hardware/system/detail/220427
+  # https://catalog.redhat.com/en/hardware/system/detail/222537
+  # https://catalog.redhat.com/en/hardware/system/detail/218827
+  - name: Intel Xeon x86_64 servers/workstations (PowerEdge, ThinkSystem, PRIMERGY, UCS, ThinkStation P7, HP Z8)
+    product_scope: rhel10
+    support_basis: certified_rhel10
+    match_scope: shared_driver
+    architecture: x86
+    paths:
+      - 'arch/x86/kernel/cpu/intel.c'
+      - 'arch/x86/kernel/cpu/intel/*'
+      - 'arch/x86/events/intel/*'
+
+  # x86_64: AMD EPYC servers, published RHEL 9/10 examples.
+  # Dell PowerEdge R6725 and XE7745, and HPE ProLiant Compute DL325 Gen12.
+  # AMD CPU/EDAC/performance paths apply across multiple machines; they do
+  # not assert certification of any otherwise unlisted system.
+  # https://catalog.redhat.com/en/hardware/system/detail/256987
+  # https://catalog.redhat.com/en/hardware/system/detail/284357
+  # https://catalog.redhat.com/en/hardware/system/detail/282457
+  - name: AMD EPYC x86_64 servers (Dell R6725/XE7745, HPE DL325 Gen12)
+    product_scope: rhel10
+    support_basis: certified_rhel10
+    match_scope: shared_driver
+    architecture: x86
+    paths:
+      - 'arch/x86/kernel/cpu/amd.c'
+      - 'arch/x86/events/amd/*'
+      - 'drivers/edac/amd64_edac.c'
+
+  # -------------------------------------------------------------------------
+  # x86_64: AMD Ryzen/Ryzen AI mobile-workstation and notebook class.
+  # Dell Pro Max MC14255 (Ryzen AI PRO) and HP EliteBook 6 G1a have published
+  # RHEL 10 certifications. AMD SoC power-management code is a processor-
+  # class proxy; it does not identify either laptop or every Ryzen system.
+  # https://catalog.redhat.com/en/hardware/system/detail/295067
+  # https://catalog.redhat.com/en/hardware/system/detail/318297
+  # https://github.com/torvalds/linux/blob/v7.0/drivers/platform/x86/amd/pmc/pmc.c
+  - name: AMD Ryzen mobile x86_64 class (Dell Pro Max MC14255, HP EliteBook 6 G1a)
+    product_scope: rhel10
+    support_basis: certified_rhel10
+    match_scope: shared_driver
+    architecture: x86
+    paths:
+      - 'drivers/platform/x86/amd/pmc/*'
+
+  # x86_64: Lenovo ThinkPad mobile workstations.
+  # Lenovo publishes RHEL 9.4 certification for ThinkPad P1 Gen 7 and RHEL
+  # 10.0 for ThinkPad P1 Gen 8. ThinkPad ACPI code supports the wider family;
+  # it is not an individual P1 Gen 7/8 machine identifier.
+  # https://support.lenovo.com/us/en/solutions/pd031426-linux-for-personal-systems
+  # https://github.com/torvalds/linux/blob/v7.0/drivers/platform/x86/lenovo/thinkpad_acpi.c
+  - name: Lenovo ThinkPad P-series x86_64 mobile workstations (P1 Gen 7/8)
+    product_scope: rhel10
+    support_basis: certified_rhel10
+    match_scope: shared_driver
+    architecture: x86
+    paths:
+      - 'drivers/platform/x86/lenovo/thinkpad_acpi.c'
+
+  # x86_64: HP ZBook mobile workstations.
+  # HP ZBook Fury G1i 16-inch has RHEL 10.0 certification. hp-wmi.c is
+  # shared HP platform firmware support, not a ZBook-specific identification.
+  # https://catalog.redhat.com/en/hardware/system/detail/266057
+  # https://github.com/torvalds/linux/blob/v7.0/drivers/platform/x86/hp/hp-wmi.c
+  - name: HP ZBook x86_64 mobile workstations (ZBook Fury G1i)
+    product_scope: rhel10
+    support_basis: certified_rhel10
+    match_scope: shared_driver
+    architecture: x86
+    paths:
+      - 'drivers/platform/x86/hp/hp-wmi.c'
+
+  # x86_64: Dell Precision mobile workstations.
+  # Precision 5490 is RHEL 9.4-certified, used here under our RHEL 9 -> 10
+  # engineering scope assumption. Dell platform drivers also serve other
+  # Dell laptops and do not uniquely identify the Precision 5490.
+  # https://catalog.redhat.com/en/hardware/system/detail/251637
+  - name: Dell Precision x86_64 mobile workstations (Precision 5490, RHEL 9.4)
+    product_scope: rhel10
+    support_basis: certified_rhel9_proxy
+    match_scope: shared_driver
+    architecture: x86
+    paths:
+      - 'drivers/platform/x86/dell/*'
+
+  # -------------------------------------------------------------------------
+  # x86_64: Public cloud GUEST environments. These entries express published
+  # RHEL 10 guest deployment support, not certification of a physical CPU or
+  # motherboard. Shared driver paths are deliberately only relevance hints.
+  #
+  # AWS EC2 x86_64 guests: ENA is shared with AWS ARM64 guests; Xen guest
+  # paths are useful for some EC2 generations, not all EC2 instance types.
+  # https://docs.redhat.com/en/documentation/red_hat_enterprise_linux/10/html-single/deploying_and_managing_rhel_on_amazon_web_services/index
+  - name: AWS EC2 x86_64 guests (RHEL 10 cloud scope)
+    product_scope: rhel10
+    support_basis: supported_guest
+    match_scope: guest_interface
+    architecture: x86
+    paths:
+      - 'arch/x86/xen/*'
+      - 'drivers/net/ethernet/amazon/ena/*'
+
+  # Microsoft Azure x86_64 guests: the x86 Hyper-V paths are architecture-
+  # specific; selected guest VMBus/netvsc files also serve ARM64 guests.
+  # https://docs.redhat.com/en/documentation/red_hat_enterprise_linux/10/html-single/deploying_and_managing_rhel_on_microsoft_azure/index
+  - name: Microsoft Azure x86_64 guests (RHEL 10 cloud scope)
+    product_scope: rhel10
+    support_basis: supported_guest
+    match_scope: guest_interface
+    architecture: x86
+    paths:
+      - 'arch/x86/hyperv/*'
+      - 'drivers/hv/vmbus_drv.c'
+      - 'drivers/hv/connection.c'
+      - 'drivers/hv/channel.c'
+      - 'drivers/hv/channel_mgmt.c'
+      - 'drivers/hv/ring_buffer.c'
+      - 'drivers/hv/hv_balloon.c'
+      - 'drivers/hv/hv_util.c'
+      - 'drivers/hv/hv_kvp.c'
+      - 'drivers/hv/hv_snapshot.c'
+      - 'drivers/net/hyperv/*'
+
+  # -------------------------------------------------------------------------
+  # x86_64 confidential-computing GUEST modes (not generic host approval).
+  # RHEL 10 supports Intel TDX GUEST use, while enabling TDX on a RHEL host
+  # remains Technology Preview. These are guest-path anchors, not evidence
+  # of certification for every Intel TDX host or physical server.
+  # https://docs.redhat.com/en/documentation/red_hat_enterprise_linux/10/html/configuring_and_managing_linux_virtual_machines/feature-support-and-limitations-in-rhel-10-virtualization
+  # https://github.com/torvalds/linux/blob/v7.0/arch/x86/coco/tdx/tdx.c
+  - name: Intel TDX x86_64 confidential guests (RHEL 10 guest scope)
+    product_scope: rhel10
+    support_basis: supported_guest
+    match_scope: guest_interface
+    architecture: x86
+    paths:
+      - 'arch/x86/coco/tdx/*'
+
+  # RHEL 10 supports AMD SEV-SNP GUEST use; enabling SEV-SNP on a RHEL
+  # virtualization host is Technology Preview. Do not treat guest support as
+  # blanket host feature enablement or hardware certification.
+  # https://docs.redhat.com/en/documentation/red_hat_enterprise_linux/10/html/configuring_and_managing_linux_virtual_machines/feature-support-and-limitations-in-rhel-10-virtualization
+  # https://github.com/torvalds/linux/blob/v7.0/arch/x86/coco/sev/core.c
+  - name: AMD SEV-SNP x86_64 confidential guests (RHEL 10 guest scope)
+    product_scope: rhel10
+    support_basis: supported_guest
+    match_scope: guest_interface
+    architecture: x86
+    paths:
+      - 'arch/x86/coco/sev/*'
+
+  # -------------------------------------------------------------------------
+  # ppc64le: IBM Power10 and Power11 pSeries/PowerVM systems.
+  # Public certified examples: IBM Power S1014, E1050, S1122.
+  # These pSeries paths are shared POWER platform code, not unique model IDs.
+  # https://catalog.redhat.com/en/hardware/system/detail/144377
+  # https://catalog.redhat.com/en/hardware/system/detail/142977
+  # https://catalog.redhat.com/en/hardware/system/detail/287077
+  - name: IBM Power pSeries and PowerVM (Power10 and Power11)
+    product_scope: rhel10
+    support_basis: certified_rhel10
+    match_scope: architecture_subsystem
+    architecture: powerpc
+    paths:
+      - 'arch/powerpc/platforms/pseries/*'
+
+  # -------------------------------------------------------------------------
+  # s390x: IBM Z and IBM LinuxONE.
+  # Public RHEL 10-certified examples: IBM z17 ME1, z16 AGZ and
+  # LinuxONE Emperor 5 ML1. Architecture-common source paths, not a
+  # reliable distinction between individual mainframe generations.
+  # https://catalog.redhat.com/en/hardware/system/detail/279167
+  # https://catalog.redhat.com/en/hardware/system/detail/223367
+  # https://catalog.redhat.com/en/hardware/system/detail/283557
+  - name: IBM Z and LinuxONE (z17, z16, LinuxONE Emperor 5)
+    product_scope: rhel10
+    support_basis: certified_rhel10
+    match_scope: architecture_subsystem
+    architecture: s390
+    paths:
+      - 'arch/s390/kernel/*'
+      - 'drivers/s390/*'
+
+# -----------------------------------------------------------------------------
+# Excluded boards: initial engineering triage from plan_06
+# -----------------------------------------------------------------------------
+# Do NOT confuse exclusion with a Red Hat certification decision.
+# Only commits whose ENTIRE changed-file set is covered by a negative match
+# are auto-excluded by kernel-backport 0.1.6. The
+# per-directory Makefile paths below handle board additions that
+# change a Makefile as well as a board DTS/DTBO; they do not themselves
+# exclude Makefile-only or unrelated boards.
+# Avoid broad */boot/dts/*, generic SoC *.dtsi, or drivers/* exclusions.
+excluded_platforms:
+  # Unselected Orange Pi SBCs; excludes board descriptions, not Rockchip SoC infrastructure.
+  - name: Orange Pi on Rockchip (5, 5 Plus, CM5 and related boards)
+    product_scope: rhel10
+    support_basis: engineering_exclusion
+    match_scope: exact_board
+    architecture: arm64
+    paths:
+      - 'arch/arm64/boot/dts/rockchip/*-orangepi-*'
+      - 'arch/arm64/boot/dts/rockchip/Makefile'
+
+  # Unselected Orange Pi single-board computers with Allwinner SoCs.
+  - name: Orange Pi on Allwinner (including Orange Pi 4A)
+    product_scope: rhel10
+    support_basis: engineering_exclusion
+    match_scope: exact_board
+    architecture: arm64
+    paths:
+      - 'arch/arm64/boot/dts/allwinner/*-orangepi-*'
+      - 'arch/arm64/boot/dts/allwinner/Makefile'
+
+  # Plan 06: e39fadd6ef7b. Exact source path; avoid excluding other CIX Sky1 systems.
+  - name: Orange Pi 6 Plus (CIX Sky1 XCP reference board)
+    product_scope: rhel10
+    support_basis: engineering_exclusion
+    match_scope: exact_board
+    architecture: arm64
+    paths:
+      - 'arch/arm64/boot/dts/cix/sky1-xcp.dts'
+      - 'arch/arm64/boot/dts/cix/Makefile'
+
+  # ArmSoM Sige1, Sige5 and other board-qualified ArmSoM DTS/DTSI.
+  - name: ArmSoM Sige and related Rockchip boards
+    product_scope: rhel10
+    support_basis: engineering_exclusion
+    match_scope: exact_board
+    architecture: arm64
+    paths:
+      - 'arch/arm64/boot/dts/rockchip/*-armsom-*'
+      - 'arch/arm64/boot/dts/rockchip/Makefile'
+
+  # Unselected Radxa ROCK SBC board descriptions; not shared Rockchip SoC definitions.
+  - name: Radxa ROCK 3/4/5 and ROCK Pi boards
+    product_scope: rhel10
+    support_basis: engineering_exclusion
+    match_scope: exact_board
+    architecture: arm64
+    paths:
+      - 'arch/arm64/boot/dts/rockchip/*-rock-*'
+      - 'arch/arm64/boot/dts/rockchip/*-rockpro64*'
+      - 'arch/arm64/boot/dts/rockchip/Makefile'
+
+  # Radxa CM3i/CM3J/CM5 module and carrier board support.
+  - name: Radxa CM3/CM5 Rockchip carrier boards
+    product_scope: rhel10
+    support_basis: engineering_exclusion
+    match_scope: exact_board
+    architecture: arm64
+    paths:
+      - 'arch/arm64/boot/dts/rockchip/*-radxa-cm*'
+      - 'arch/arm64/boot/dts/rockchip/Makefile'
+
+  # RK3576/RK3588 EVB board files; not shared rk3576.dtsi or rk3588.dtsi.
+  - name: Rockchip RK3576 and RK3588 evaluation boards
+    product_scope: rhel10
+    support_basis: engineering_exclusion
+    match_scope: exact_board
+    architecture: arm64
+    paths:
+      - 'arch/arm64/boot/dts/rockchip/rk3576-evb1*'
+      - 'arch/arm64/boot/dts/rockchip/rk3588*-evb1*'
+      - 'arch/arm64/boot/dts/rockchip/Makefile'
+
+  # Plan 06 includes NanoPi R76S and M5.
+  - name: FriendlyElec NanoPi and NanoPC Rockchip boards
+    product_scope: rhel10
+    support_basis: engineering_exclusion
+    match_scope: exact_board
+    architecture: arm64
+    paths:
+      - 'arch/arm64/boot/dts/rockchip/*-nanopi-*'
+      - 'arch/arm64/boot/dts/rockchip/*-nanopc-*'
+      - 'arch/arm64/boot/dts/rockchip/Makefile'
+
+  # Plan 06 QNAP TS133/233/433/TSx33 board-specific DT changes.
+  - name: QNAP TSx33 Rockchip NAS boards
+    product_scope: rhel10
+    support_basis: engineering_exclusion
+    match_scope: exact_board
+    architecture: arm64
+    paths:
+      - 'arch/arm64/boot/dts/rockchip/*-qnap-ts*'
+      - 'arch/arm64/boot/dts/rockchip/Makefile'
+
+  # Unselected PINE64 consumer devices; generic Rockchip code unaffected.
+  - name: PINE64 PinePhone Pro and Pinebook Pro
+    product_scope: rhel10
+    support_basis: engineering_exclusion
+    match_scope: exact_board
+    architecture: arm64
+    paths:
+      - 'arch/arm64/boot/dts/rockchip/*-pinephone-*'
+      - 'arch/arm64/boot/dts/rockchip/*-pinebook-*'
+      - 'arch/arm64/boot/dts/rockchip/Makefile'
+
+  # Explicit requested scope exclusion; does not exclude generic bcm2711.dtsi.
+  - name: Raspberry Pi 4B, 400 and CM4
+    product_scope: rhel10
+    support_basis: engineering_exclusion
+    match_scope: exact_board
+    architecture: arm64
+    paths:
+      - 'arch/arm64/boot/dts/broadcom/bcm2711-rpi-4-*'
+      - 'arch/arm64/boot/dts/broadcom/bcm2711-rpi-400*'
+      - 'arch/arm64/boot/dts/broadcom/bcm2711-rpi-cm4*'
+      - 'arch/arm64/boot/dts/broadcom/Makefile'
+
+  # Treat Raspberry Pi 5 board additions similarly, pending positive RHEL scope evidence.
+  - name: Raspberry Pi 5 board family
+    product_scope: rhel10
+    support_basis: engineering_exclusion
+    match_scope: exact_board
+    architecture: arm64
+    paths:
+      - 'arch/arm64/boot/dts/broadcom/bcm2712-rpi-5-*'
+      - 'arch/arm64/boot/dts/broadcom/bcm2712-rpi-cm5*'
+      - 'arch/arm64/boot/dts/broadcom/Makefile'
+
+  # Plan 06 BPI-R3/R4 SD/eMMC/PCIe board overlays; not MediaTek common drivers.
+  - name: Banana Pi BPI-R3/R4 MediaTek boards and overlays
+    product_scope: rhel10
+    support_basis: engineering_exclusion
+    match_scope: exact_board
+    architecture: arm64
+    paths:
+      - 'arch/arm64/boot/dts/mediatek/mt*-bananapi-*'
+      - 'arch/arm64/boot/dts/mediatek/Makefile'
+
+  # Plan 06 Radxa NIO 12L and related MediaTek board-specific changes.
+  - name: Radxa NIO MediaTek boards
+    product_scope: rhel10
+    support_basis: engineering_exclusion
+    match_scope: exact_board
+    architecture: arm64
+    paths:
+      - 'arch/arm64/boot/dts/mediatek/mt*-radxa-*'
+      - 'arch/arm64/boot/dts/mediatek/Makefile'
+
+  # Plan 06 OpenWrt One; a router-target board, not RHEL system certification.
+  - name: OpenWrt One MediaTek reference board
+    product_scope: rhel10
+    support_basis: engineering_exclusion
+    match_scope: exact_board
+    architecture: arm64
+    paths:
+      - 'arch/arm64/boot/dts/mediatek/mt*-openwrt-one*'
+      - 'arch/arm64/boot/dts/mediatek/Makefile'
+
+  # Plan 06 MT8183 Pumpkin board-only enablement.
+  - name: MediaTek MT8183 Pumpkin demonstration board
+    product_scope: rhel10
+    support_basis: engineering_exclusion
+    match_scope: exact_board
+    architecture: arm64
+    paths:
+      - 'arch/arm64/boot/dts/mediatek/mt8183-pumpkin*'
+      - 'arch/arm64/boot/dts/mediatek/Makefile'
+
+  # Plan 06 Radxa Zero and Zero 2 devices.
+  - name: Radxa Zero Amlogic boards
+    product_scope: rhel10
+    support_basis: engineering_exclusion
+    match_scope: exact_board
+    architecture: arm64
+    paths:
+      - 'arch/arm64/boot/dts/amlogic/meson-*-radxa-zero*'
+      - 'arch/arm64/boot/dts/amlogic/Makefile'
+
+  # Plan 06 Khadas VIM1S; not generic Amlogic DTSI.
+  - name: Khadas VIM Amlogic boards
+    product_scope: rhel10
+    support_basis: engineering_exclusion
+    match_scope: exact_board
+    architecture: arm64
+    paths:
+      - 'arch/arm64/boot/dts/amlogic/meson-*-khadas-*'
+      - 'arch/arm64/boot/dts/amlogic/Makefile'
+
+  # Plan 06 ODROID HC4; retain generic Amlogic infrastructure.
+  - name: Hardkernel ODROID Amlogic boards
+    product_scope: rhel10
+    support_basis: engineering_exclusion
+    match_scope: exact_board
+    architecture: arm64
+    paths:
+      - 'arch/arm64/boot/dts/amlogic/meson-*-odroid*'
+      - 'arch/arm64/boot/dts/amlogic/Makefile'
+
+  # Plan 05 Amlogic Xiaomi Aquaman device; not shared clocks.
+  - name: Xiaomi Mi TV Stick Amlogic board
+    product_scope: rhel10
+    support_basis: engineering_exclusion
+    match_scope: exact_board
+    architecture: arm64
+    paths:
+      - 'arch/arm64/boot/dts/amlogic/meson-*-xiaomi-*'
+      - 'arch/arm64/boot/dts/amlogic/Makefile'
+
+  # Plan 06 OnePlus device trees only.
+  - name: OnePlus Qualcomm smartphones
+    product_scope: rhel10
+    support_basis: engineering_exclusion
+    match_scope: exact_board
+    architecture: arm64
+    paths:
+      - 'arch/arm64/boot/dts/qcom/*-oneplus*'
+      - 'arch/arm64/boot/dts/qcom/Makefile'
+
+  # Plan 06 Fairphone 5 and related consumer phone boards.
+  - name: Fairphone Qualcomm smartphones
+    product_scope: rhel10
+    support_basis: engineering_exclusion
+    match_scope: exact_board
+    architecture: arm64
+    paths:
+      - 'arch/arm64/boot/dts/qcom/*-fairphone-*'
+      - 'arch/arm64/boot/dts/qcom/Makefile'
+
+  # Plan 06 Xiaomi phone board descriptions; no generic Qualcomm driver exclusion.
+  - name: Xiaomi Qualcomm smartphones
+    product_scope: rhel10
+    support_basis: engineering_exclusion
+    match_scope: exact_board
+    architecture: arm64
+    paths:
+      - 'arch/arm64/boot/dts/qcom/*-xiaomi-*'
+      - 'arch/arm64/boot/dts/qcom/Makefile'
+
+  # Explicitly out-of-scope Qualcomm Kaanapali SoC and reference designs.
+  # Excludes Kaanapali-specific DTS/DTSI only, not shared Qualcomm drivers,
+  # Lemans/Ride RHIVOS infrastructure, or unrelated changes to the DTS Makefile.
+  - name: Qualcomm Kaanapali SoC and reference boards
+    product_scope: rhel10
+    support_basis: engineering_exclusion
+    match_scope: soc_shared
+    architecture: arm64
+    paths:
+      - 'arch/arm64/boot/dts/qcom/*kaanapali*'
+      - 'arch/arm64/boot/dts/qcom/Makefile'
+
+  # Consumer phone device-tree descriptions.
+  - name: Sony Xperia Qualcomm smartphones
+    product_scope: rhel10
+    support_basis: engineering_exclusion
+    match_scope: exact_board
+    architecture: arm64
+    paths:
+      - 'arch/arm64/boot/dts/qcom/*-sony-xperia-*'
+      - 'arch/arm64/boot/dts/qcom/*-sony-suzu*'
+      - 'arch/arm64/boot/dts/qcom/Makefile'
+
+  # Purism Librem 5 handset, not RHEL9-certified systems in planning scope.
+  - name: Purism Librem 5 i.MX8MQ handset
+    product_scope: rhel10
+    support_basis: engineering_exclusion
+    match_scope: exact_board
+    architecture: arm64
+    paths:
+      - 'arch/arm64/boot/dts/freescale/imx8mq-librem5*'
+      - 'arch/arm64/boot/dts/freescale/Makefile'
+
+  # Consumer/developer board-specific TI DTS, not shared AM62 SoC support.
+  - name: BeagleBone and PocketBeagle TI development boards
+    product_scope: rhel10
+    support_basis: engineering_exclusion
+    match_scope: exact_board
+    architecture: arm64
+    paths:
+      - 'arch/arm64/boot/dts/ti/*-beaglebone*'
+      - 'arch/arm64/boot/dts/ti/*-pocketbeagle*'
+      - 'arch/arm64/boot/dts/ti/*-beagleplay*'
+      - 'arch/arm64/boot/dts/ti/Makefile'
+
+  # MacBook/iMac/Mac Pro board descriptions; SoC DTSI and drivers remain independent.
+  - name: Apple Silicon Mac device-tree boards
+    product_scope: rhel10
+    support_basis: engineering_exclusion
+    match_scope: exact_board
+    architecture: arm64
+    paths:
+      - 'arch/arm64/boot/dts/apple/*.dts'
+      - 'arch/arm64/boot/dts/apple/Makefile'
+
+  # Plan 06 Smaug tablet DT source; not Jetson Orin or Grace.
+  - name: Google Pixel C Tegra210 Smaug tablet
+    product_scope: rhel10
+    support_basis: engineering_exclusion
+    match_scope: exact_board
+    architecture: arm64
+    paths:
+      - 'arch/arm64/boot/dts/nvidia/tegra210-smaug*'
+      - 'arch/arm64/boot/dts/nvidia/Makefile'
+
+  # Research platform DTS (not standards-based RHEL server hardware).
+  - name: Arm Morello research board
+    product_scope: rhel10
+    support_basis: engineering_exclusion
+    match_scope: exact_board
+    architecture: arm64
+    paths:
+      - 'arch/arm64/boot/dts/arm/morello*.dts'
+      - 'arch/arm64/boot/dts/arm/morello*.dtsi'
+      - 'arch/arm64/boot/dts/arm/Makefile'

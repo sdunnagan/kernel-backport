@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# Example launcher for kernel-backport; customize per workspace.
+set -euo pipefail
+umask 077
+export TMPDIR="$HOME/tmp"
+mkdir -p "$TMPDIR"
+
+: "${KERNEL_WORKSPACE_DIR:?Set KERNEL_WORKSPACE_DIR}"
+: "${KERNEL_BACKPORT:?Set KERNEL_BACKPORT to your consolidated executable}"
+: "${PROJECT_ID:?Set PROJECT_ID for applying and resuming backports}"
+: "${CS_VERSION:?Set CS_VERSION}"
+PLATFORMS="$KERNEL_WORKSPACE_DIR/rhel-10-platforms.yaml"
+FILE_LIST="$KERNEL_WORKSPACE_DIR/file_list.txt"
+[[ -r "$PLATFORMS" ]] || { echo "Missing: $PLATFORMS" >&2; exit 1; }
+[[ -s "$FILE_LIST" ]] || { echo "Missing/empty: $FILE_LIST" >&2; exit 1; }
+python3 -c 'import yaml' || { echo "Install PyYAML" >&2; exit 1; }
+# The Python tool securely loads ~/.config/kernel-backport/openai.env
+# itself unless OPENAI_API_KEY is already exported.
+
+cd -- "$KERNEL_WORKSPACE_DIR/centos-stream-$CS_VERSION"
+time "$KERNEL_BACKPORT" plan \
+    --update \
+    --upstream linux-stable \
+    --downstream cs10 \
+    --downstream-ref HEAD \
+    --base v6.19 \
+    --target v7.0 \
+    --file-list "$FILE_LIST" \
+    --platforms "$PLATFORMS" \
+    --architecture arm64 \
+    --advisor=openai \
+    --advisor-model gpt-6.1-terra \
+    --advisor-escalation-model gpt-6.1-sol \
+    --advisor-escalation-policy selective \
+    --advisor-escalation-limit 96 \
+    --advisor-max-request-chars 120000 \
+    --advisor-output-reserve 1024 \
+    --advisor-trace \
+    "$@"
