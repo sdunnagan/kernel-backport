@@ -20,6 +20,34 @@ Kernel compilation and runtime validation are **outside** this tool. Use a
 separate build workflow, such as `kernel-build`, and the product's normal
 qualification process.
 
+## Why kernel-backport instead of a general-purpose AI agent?
+
+An AI coding agent can inspect Git history, propose commits, resolve conflicts,
+and run builds. For a small backport, that may be enough. For a large or
+long-running backport, the challenge is also to maintain a defensible selection
+and a reproducible record of what was planned, decided, applied, adapted, and
+validated.
+
+`kernel-backport` provides deterministic scaffolding for that work. Git-based
+analysis, explicit product scope, recorded dependency and `Fixes:` evidence,
+frozen plans, consistency checks, and guarded execution journals persist
+independently of any AI model or conversation. The journal can reconcile an
+engineer's manually adapted commit and resume at the next pending change
+without relying on an AI agent to reconstruct execution history.
+
+AI advisors contribute where semantic judgment is useful, such as assessing
+platform relevance, prerequisites, subsequent fixes, and integration risks.
+Their recommendations and rationales are reviewable evidence, not instructions
+to apply blindly. Engineers retain authority over the selected changes,
+conflict resolutions, and final validation. The underlying process does not
+depend on a particular model or its ability to remember earlier sessions.
+
+The objective is **not to replace kernel engineers with AI**, but to give them
+a controlled, resumable, and auditable process in which AI can contribute
+without becoming the sole authority. A complete execution journal is not a
+proof of kernel correctness; builds, boot tests, kABI checks, and product
+qualification remain essential.
+
 ## The workflow and its questions
 
 Keep these stages distinct:
